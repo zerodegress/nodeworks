@@ -34,7 +34,6 @@ import net.minecraft.world.phys.Vec3
 import net.neoforged.bus.api.IEventBus
 import net.neoforged.fml.event.lifecycle.FMLClientSetupEvent
 import net.neoforged.neoforge.client.event.RegisterMenuScreensEvent
-import net.neoforged.neoforge.client.event.RenderFrameEvent
 import net.neoforged.neoforge.client.event.RenderLevelStageEvent
 import net.neoforged.neoforge.client.network.ClientPacketDistributor
 import net.neoforged.neoforge.common.NeoForge
@@ -73,6 +72,7 @@ object NeoForgeClientSetup {
         }
         NeoForge.EVENT_BUS.addListener { _: net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent.LoggingOut ->
             damien.nodeworks.recipe.SoulSandInfusionClientCache.clear()
+            damien.nodeworks.item.NetworkWrenchItem.clientSelectedPos = null
         }
 
         // Block other mods (JEI) from stealing key events when our terminal editor is active.
@@ -117,15 +117,6 @@ object NeoForgeClientSetup {
 
             NodeConnectionRenderer.register()
             damien.nodeworks.render.CardPlacementPreviewRenderer.init()
-
-            // Reset the frame-scoped laser-beam dedup set at the start of each render
-            // frame. ConnectionBeamRenderer.submit uses this set to ensure a beam between
-            // two Connectables is drawn exactly once per frame regardless of which end's
-            // BER submits first, no lex-order dedup, no silent drops if one BER isn't
-            // wired or one endpoint is unloaded.
-            NeoForge.EVENT_BUS.addListener { _: RenderFrameEvent.Pre ->
-                damien.nodeworks.render.ConnectionBeamRenderer.startFrame()
-            }
         }
     }
 

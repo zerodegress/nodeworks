@@ -21,8 +21,20 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class NetworkInventoryCache(
     private val level: ServerLevel,
-    private val networkEntryNode: BlockPos
+    private var networkEntryNode: BlockPos
 ) {
+    /** Reseat the BFS entry point and re-poll synchronously. Used when a UI consumer
+     *  opens against a cache built earlier by a now-destroyed consumer, the stale entry
+     *  point resolves to a missing BE so the natural cycle would empty [entries].
+     *  Mirroring [init]'s scan here populates the cache before the caller returns. */
+    fun rebindEntryPoint(pos: BlockPos) {
+        if (networkEntryNode == pos) return
+        networkEntryNode = pos
+        val cards = snapshotCardsForCycle()
+        for (card in cards) pollCard(card)
+        finalizeAndDiff()
+    }
+
     data class SerialEntry(
         val serial: Long,
         val info: ItemInfo
@@ -83,14 +95,35 @@ class NetworkInventoryCache(
         private val caches = ConcurrentHashMap<String, NetworkInventoryCache>()
 
         fun getOrCreate(level: ServerLevel, networkEntryNode: BlockPos): NetworkInventoryCache {
-            // Discover network to find the controller UUID for the key
+            // Key on controller permanentId so all consumers of one network share a cache.
             val snapshot = damien.nodeworks.network.NetworkDiscovery.discoverNetwork(level, networkEntryNode)
-            val key = if (snapshot.networkId != null) {
-                snapshot.networkId.toString()
-            } else {
-                "${level.dimension().toString()}:${networkEntryNode.asLong()}"
+            val uuidKey = snapshot.networkId?.toString()
+            val fallbackKey = "${level.dimension().toString()}:${networkEntryNode.asLong()}"
+
+            // Self-heal orphans from a prior multi-controller conflict period: a
+            // consumer that opened during the conflict was keyed on dim:pos because
+            // [snapshot.networkId] was null. Once the conflict resolves, that orphan
+            // would never be evicted, controller cleanup only fires removeByUUID and
+            // the dim:pos entry stays in [caches] ticking forever. Migrate this
+            // caller's-position orphan onto the UUID key so the consumer's next call
+            // self-heals without requiring multiple opens.
+            if (uuidKey != null) {
+                val orphan = caches.remove(fallbackKey)
+                if (orphan != null) caches.putIfAbsent(uuidKey, orphan)
             }
-            return caches.getOrPut(key) { NetworkInventoryCache(level, networkEntryNode) }
+
+            val key = uuidKey ?: fallbackKey
+            val existing = caches[key]
+            if (existing != null) {
+                // The cached entry point may belong to a consumer that's since been
+                // destroyed, adopt the live caller's pos so the next cycle's BFS starts
+                // from a still-loaded Connectable.
+                existing.rebindEntryPoint(networkEntryNode)
+                return existing
+            }
+            val fresh = NetworkInventoryCache(level, networkEntryNode)
+            caches[key] = fresh
+            return fresh
         }
 
         fun removeByUUID(uuid: java.util.UUID) {
@@ -270,15 +303,16 @@ class NetworkInventoryCache(
         var changed = false
 
         // Items removed: anything in entries the latest poll didn't see.
-        val itemKeys = entries.keys.toSet()
-        for (key in itemKeys) {
+        // Iterator-based eviction avoids a full keyset copy every cycle-end.
+        val iter = entries.entries.iterator()
+        while (iter.hasNext()) {
+            val (key, entry) = iter.next()
             if (key in dirtyKeys) continue
-            if (key !in frontBuffer) {
-                val entry = entries.remove(key) ?: continue
-                removedSerials.add(entry.serial)
-                changedSerials.remove(entry.serial)
-                changed = true
-            }
+            if (key in frontBuffer) continue
+            iter.remove()
+            removedSerials.add(entry.serial)
+            changedSerials.remove(entry.serial)
+            changed = true
         }
 
         // Items added or changed. count + isCraftable are both diffed: adding /
@@ -316,15 +350,15 @@ class NetworkInventoryCache(
         }
 
         // Fluids, same shape.
-        val fluidKeys = fluidEntries.keys.toSet()
-        for (key in fluidKeys) {
+        val fluidIter = fluidEntries.entries.iterator()
+        while (fluidIter.hasNext()) {
+            val (key, entry) = fluidIter.next()
             if (key in dirtyFluidKeys) continue
-            if (key !in fluidFrontBuffer) {
-                val entry = fluidEntries.remove(key) ?: continue
-                removedSerials.add(entry.serial)
-                changedFluidSerials.remove(entry.serial)
-                changed = true
-            }
+            if (key in fluidFrontBuffer) continue
+            fluidIter.remove()
+            removedSerials.add(entry.serial)
+            changedFluidSerials.remove(entry.serial)
+            changed = true
         }
         for ((key, info) in fluidFrontBuffer) {
             if (key in dirtyFluidKeys) continue
@@ -349,7 +383,25 @@ class NetworkInventoryCache(
 
     // --- Queries ---
 
+    /** True for filters that resolve to an exact item id with no wildcards or
+     *  predicate syntax. `*`, `#tag`, `/regex/`, `mod:*`. Those need full
+     *  iteration, but a bare `mod:item` filter is just a HashMap lookup. */
+    private fun isExactItemFilter(filter: String): Boolean {
+        if (filter == "*" || filter.isEmpty()) return false
+        if (filter.startsWith("#") || filter.startsWith("/")) return false
+        if (filter.endsWith(":*")) return false
+        if (filter.startsWith("\$item:") || filter.startsWith("\$fluid:")) return false
+        return true
+    }
+
     fun count(filter: String): Long {
+        // Fast path so 500 Monitors × every-20-ticks polling for exact ids stays
+        // O(1) per query instead of O(entries).
+        if (isExactItemFilter(filter)) {
+            val a = entries[cacheKey(filter, false)]?.info?.count ?: 0L
+            val b = entries[cacheKey(filter, true)]?.info?.count ?: 0L
+            return a + b
+        }
         var total = 0L
         for ((_, entry) in entries) {
             if (CardHandle.matchesFilter(entry.info.itemId, filter)) {
@@ -381,8 +433,8 @@ class NetworkInventoryCache(
     fun getAllFluidEntries(): Collection<FluidSerialEntry> = fluidEntries.values
 
     fun hasChanges(): Boolean = changedSerials.isNotEmpty() ||
-        changedFluidSerials.isNotEmpty() ||
-        removedSerials.isNotEmpty()
+            changedFluidSerials.isNotEmpty() ||
+            removedSerials.isNotEmpty()
 
     fun consumeChanges(): Pair<List<SerialEntry>, List<Long>> {
         val changed = changedSerials.mapNotNull { serial ->
@@ -421,7 +473,7 @@ class NetworkInventoryCache(
             // inserted damaged tool gets its bar immediately even if the bucket
             // already held a default-state instance from a prior insert.
             val mergedPatch = if (existing.info.componentsPatch.isEmpty) componentsPatch
-                else existing.info.componentsPatch
+            else existing.info.componentsPatch
             entries[key] = existing.copy(
                 info = existing.info.copy(
                     count = existing.info.count + amount,
@@ -433,14 +485,16 @@ class NetworkInventoryCache(
             val identifier = net.minecraft.resources.Identifier.tryParse(itemId) ?: return
             val item = net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(identifier) ?: return
             val serial = nextSerial++
-            entries[key] = SerialEntry(serial, ItemInfo(
-                itemId = itemId,
-                name = net.minecraft.world.item.ItemStack(item).hoverName.string,
-                count = amount,
-                maxStackSize = item.getDefaultMaxStackSize(),
-                hasData = hasData,
-                componentsPatch = componentsPatch,
-            ))
+            entries[key] = SerialEntry(
+                serial, ItemInfo(
+                    itemId = itemId,
+                    name = net.minecraft.world.item.ItemStack(item).hoverName.string,
+                    count = amount,
+                    maxStackSize = item.getDefaultMaxStackSize(),
+                    hasData = hasData,
+                    componentsPatch = componentsPatch,
+                )
+            )
             changedSerials.add(serial)
         }
     }
