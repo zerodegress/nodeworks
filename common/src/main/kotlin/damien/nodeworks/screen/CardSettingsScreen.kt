@@ -70,6 +70,8 @@ class CardSettingsScreen(
         val initial = menu.getChannel()
         lastSyncedChannel = initial.id
         picker = ChannelPickerWidget(leftPos + pickerX, pickerY, initial) { color ->
+            // canBeNone = false here, so color is never null in practice.
+            if (color == null) return@ChannelPickerWidget
             // Server sees the choice via the menu button id, the screen-side widget
             // already updated currentColor synchronously so the swatch reflects the
             // pick before the round-trip lands. The next data-sync tick then pushes
@@ -85,6 +87,7 @@ class CardSettingsScreen(
                     damien.nodeworks.network.SetCardNamePayload(menu.containerId, name)
                 )
             },
+            requestDefocus = { setFocused(null) },
         )
         renameRow.addToScreen { addRenderableWidget(it) }
     }

@@ -17,7 +17,9 @@ import damien.nodeworks.network.SetStorageCardFilterRulesPayload
 import damien.nodeworks.platform.PlatformServices
 import damien.nodeworks.screen.widget.CardRenameRow
 import damien.nodeworks.screen.widget.ChannelPickerWidget
+import damien.nodeworks.screen.widget.FacePickerWidget
 import damien.nodeworks.screen.widget.FilterRuleAutocomplete
+import damien.nodeworks.screen.widget.RelDir
 import net.minecraft.client.input.CharacterEvent
 import net.minecraft.client.input.KeyEvent
 import net.minecraft.client.input.MouseButtonEvent
@@ -118,8 +120,12 @@ class StorageCardScreen(
         private const val LABEL_TO_BTN_GAP = 4
         private const val CHANNEL_LABEL_TO_PICKER_GAP = 4
         private const val PRIORITY_LABEL_TEXT = "Priority:"
-        private const val CHANNEL_LABEL_TEXT = "Channel:"
         private const val FILTER_LABEL_TEXT = "Filter"
+        /** Right-edge inset for the channel + side swatches (matches
+         *  [TOP_INSET_X]'s left padding for visual symmetry). */
+        private const val SWATCHES_RIGHT_PAD = 4
+        /** Gap between the right-justified channel and side swatches. */
+        private const val SWATCH_PAIR_GAP = 4
 
         // Cycle button colors. State is conveyed by the icon, not the bg,
         // so all buttons use [NEUTRAL_BG]. Hover variant only matters for
@@ -161,15 +167,17 @@ class StorageCardScreen(
     private var priorityField: EditBox? = null
     private var lastSyncedPriority = -1
     private var lastSyncedChannel = -1
+    private var lastSyncedSideOrdinal = Int.MIN_VALUE
     private var picker: ChannelPickerWidget? = null
+    private var sidePicker: FacePickerWidget? = null
 
     // Layout positions resolved once in init() since they depend on font widths.
     private var priorityLabelX = 0
     private var priorityMinusX = 0
     private var priorityFieldX = 0
     private var priorityPlusX = 0
-    private var channelLabelX = 0
     private var pickerX = 0
+    private var sidePickerX = 0
 
     /** Local mirror of the rule list. The screen mutates this and pushes the
      *  full list to the server via [SetStorageCardFilterRulesPayload]. */
@@ -232,6 +240,7 @@ class StorageCardScreen(
                     damien.nodeworks.network.SetCardNamePayload(menu.containerId, name)
                 )
             },
+            requestDefocus = { setFocused(null) },
         )
         renameRow.addToScreen { addRenderableWidget(it) }
     }
@@ -245,27 +254,32 @@ class StorageCardScreen(
         val priorityRowW = priorityLabelW + LABEL_TO_BTN_GAP +
             STEPPER_BTN_SIZE + STEPPER_GAP +
             PRIORITY_FIELD_W + STEPPER_GAP + STEPPER_BTN_SIZE
-        val channelLabelW = font.width(CHANNEL_LABEL_TEXT)
-        val channelRowW = channelLabelW + CHANNEL_LABEL_TO_PICKER_GAP + ChannelPickerWidget.SWATCH
 
-        // Distribute the two clusters across the inset width with equal margin
-        // on each side and a small gap in the middle. The inset is W-8 wide.
-        val totalW = priorityRowW + 16 + channelRowW
-        val startX = (W - totalW) / 2
+        // Priority sits at its pre-side-picker position: centred with a
+        // hypothetical "Channel:" label + swatch cluster on the right, the
+        // same shape this GUI had before the side picker landed. The two
+        // swatches now flush against the inset's right edge instead of
+        // claiming a third cluster slot.
+        val legacyChannelW = font.width("Channel:") + CHANNEL_LABEL_TO_PICKER_GAP + ChannelPickerWidget.SWATCH
+        val legacyTotalW = priorityRowW + 16 + legacyChannelW
+        val priorityStartX = (W - legacyTotalW) / 2
 
-        priorityLabelX = startX
+        priorityLabelX = priorityStartX
         priorityMinusX = priorityLabelX + priorityLabelW + LABEL_TO_BTN_GAP
         priorityFieldX = priorityMinusX + STEPPER_BTN_SIZE + STEPPER_GAP
         priorityPlusX = priorityFieldX + PRIORITY_FIELD_W + STEPPER_GAP
 
-        val priorityRowEnd = priorityPlusX + STEPPER_BTN_SIZE
-        channelLabelX = priorityRowEnd + 16
-        pickerX = channelLabelX + channelLabelW + CHANNEL_LABEL_TO_PICKER_GAP
+        // Right-justify the channel + side swatches against the inset's right
+        // edge. Side hugs the corner, channel sits one swatch + gap to its
+        // left.
+        val rightEdge = TOP_INSET_X + TOP_INSET_W - SWATCHES_RIGHT_PAD
+        sidePickerX = rightEdge - FacePickerWidget.SWATCH
+        pickerX = sidePickerX - SWATCH_PAIR_GAP - ChannelPickerWidget.SWATCH
 
-        // 1 px nudge down on the priority/channel widgets so the row optically
-        // sits in the lower half of the inset (the inset frame's top bevel
-        // visually adds weight at the top, which made centred widgets read
-        // as drifting upward). The inset itself is unmoved.
+        // 1 px nudge down on the priority/channel/side widgets so the row
+        // optically sits in the lower half of the inset (the inset frame's
+        // top bevel visually adds weight at the top, which made centred
+        // widgets read as drifting upward). The inset itself is unmoved.
         val fieldY = topPos + TOP_INSET_Y + (TOP_INSET_H - 12) / 2 + 1
         priorityField = EditBox(font, leftPos + priorityFieldX, fieldY, PRIORITY_FIELD_W, 12, Component.literal("Priority"))
         priorityField!!.setMaxLength(3)
@@ -277,10 +291,23 @@ class StorageCardScreen(
         val initialChannel = menu.getChannel()
         lastSyncedChannel = initialChannel.id
         picker = ChannelPickerWidget(leftPos + pickerX, pickerY, initialChannel) { color ->
+            if (color == null) return@ChannelPickerWidget
             playClickSound()
             Minecraft.getInstance().gameMode?.handleInventoryButtonClick(menu.containerId, 2000 + color.id)
         }
         addRenderableWidget(picker!!)
+
+        val initialSide = menu.getCustomSide()
+        lastSyncedSideOrdinal = initialSide?.ordinal ?: -1
+        sidePicker = FacePickerWidget(
+            leftPos + sidePickerX, pickerY, initialSide,
+        ) { rel ->
+            playClickSound()
+            // 4000 = clear (use default face), 4001+ord = pick a RelDir.
+            val buttonId = if (rel == null) 4000 else 4001 + rel.ordinal
+            Minecraft.getInstance().gameMode?.handleInventoryButtonClick(menu.containerId, buttonId)
+        }
+        addRenderableWidget(sidePicker!!)
     }
 
     /**
@@ -342,6 +369,7 @@ class StorageCardScreen(
             val boxX = listInteriorX + iconColumnW
             val box = EditBox(font, boxX, boxY, fieldW, 12, Component.literal("Rule"))
             box.setMaxLength(SetStorageCardFilterRulesPayload.MAX_RULE_LENGTH)
+            box.setHint(Component.literal("item id / tag / pattern").withStyle(net.minecraft.ChatFormatting.DARK_GRAY))
             box.value = localRules[ruleIdx]
             box.setResponder { _ -> /* commit on blur / enter / close */ }
             addRenderableWidget(box)
@@ -523,7 +551,21 @@ class StorageCardScreen(
         graphics.drawString(font, "-", mX + (btn - font.width("-")) / 2, stepY + 3, 0xFFFFFFFF.toInt())
         graphics.drawString(font, "+", pX + (btn - font.width("+")) / 2, stepY + 3, 0xFFFFFFFF.toInt())
 
-        graphics.drawString(font, CHANNEL_LABEL_TEXT, leftPos + channelLabelX, labelY, 0xFFAAAAAA.toInt())
+        // The two right-justified swatches (channel + side) draw themselves as
+        // registered widgets, no labels. Hover tooltips disambiguate.
+        val swatchY = topPos + TOP_INSET_Y + (TOP_INSET_H - FacePickerWidget.SWATCH) / 2 + 1
+        val sideLeft = leftPos + sidePickerX
+        if (mouseX in sideLeft until sideLeft + FacePickerWidget.SWATCH &&
+            mouseY in swatchY until swatchY + FacePickerWidget.SWATCH &&
+            sidePicker?.expanded != true
+        ) {
+            val side = menu.getCustomSide()
+            if (side == null) {
+                queueTooltip(mouseX, mouseY, "Side: Default", "Click to override.")
+            } else {
+                queueTooltip(mouseX, mouseY, "Side: ${side.displayName}", "Click to change.")
+            }
+        }
     }
 
     private fun renderFilterHeader(graphics: GuiGraphicsExtractor, mouseX: Int, mouseY: Int) {
@@ -690,15 +732,26 @@ class StorageCardScreen(
 
             if (ruleIdx >= localRules.size) continue
 
-            // Item icon on the left of the row, vertically centred against
-            // the visible row interior. Skipped (just empty space) when the
-            // rule resolves to no concrete item, e.g. `*` / `/regex/` /
-            // namespace wildcards. Tag rules (`#minecraft:logs`) cycle
-            // through members on a shared timer, see [resolveRowIcon].
+            // Slot-backed item icon on the left of the row, vertically centred
+            // against the visible row interior. Slot is 16×16 with the icon
+            // scaled to 14×14 so the slot fits inside the 16-tall row without
+            // clipping the SEPARATOR. Slot draws regardless of whether the
+            // rule resolves to a concrete item (`*` / `/regex/` / namespace
+            // wildcards leave it empty), matching the User device's filter row.
+            // Tag rules (`#minecraft:logs`) cycle members on a shared timer,
+            // see [resolveRowIcon].
+            val slotSize = ROW_ICON_SIZE
+            val iconDrawSize = slotSize - 2
+            val slotX = interiorX + ROW_ICON_PAD
+            val slotY = rowY + (ROW_H - SEPARATOR_OVERLAP - slotSize) / 2
+            NineSlice.SLOT.draw(graphics, slotX, slotY, slotSize, slotSize)
             resolveRowIcon(localRules[ruleIdx])?.let { iconStack ->
-                val iconX = interiorX + ROW_ICON_PAD
-                val iconY = rowY + (ROW_H - SEPARATOR_OVERLAP - ROW_ICON_SIZE) / 2
-                graphics.renderItem(iconStack, iconX, iconY)
+                val scale = iconDrawSize / 16f
+                graphics.pose().pushMatrix()
+                graphics.pose().translate((slotX + 1).toFloat(), (slotY + 1).toFloat())
+                graphics.pose().scale(scale, scale)
+                graphics.renderItem(iconStack, 0, 0)
+                graphics.pose().popMatrix()
             }
 
             // Delete button on the right of the row. Top edge stays anchored
@@ -852,11 +905,19 @@ class StorageCardScreen(
             picker?.setColor(runCatching { DyeColor.byId(serverChannel) }.getOrDefault(DyeColor.WHITE))
             lastSyncedChannel = serverChannel
         }
+        val serverSideOrdinal = menu.customSideData.get(0)
+        if (serverSideOrdinal != lastSyncedSideOrdinal && sidePicker?.expanded != true) {
+            val rel = if (serverSideOrdinal < 0) null
+                else RelDir.entries.getOrNull(serverSideOrdinal)
+            sidePicker?.setFace(rel)
+            lastSyncedSideOrdinal = serverSideOrdinal
+        }
 
         syncAutocompleteToFocus()
 
         super.extractRenderState(graphics, mouseX, mouseY, partialTick)
         picker?.renderOverlay(graphics, mouseX, mouseY)
+        sidePicker?.renderOverlay(graphics, mouseX, mouseY)
         autocomplete.render(graphics, mouseX, mouseY)
         if (pendingTooltipLines.isNotEmpty()) {
             graphics.renderComponentTooltip(font, pendingTooltipLines, pendingTooltipX, pendingTooltipY)
@@ -899,6 +960,9 @@ class StorageCardScreen(
     override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {
         if (picker?.expanded == true) {
             if (picker!!.handleOverlayClick(event.mouseX, event.mouseY)) return true
+        }
+        if (sidePicker?.expanded == true) {
+            if (sidePicker!!.handleOverlayClick(event.mouseX, event.mouseY)) return true
         }
         if (renameRow.mouseClicked(event)) return true
         val mx = event.mouseX.toInt()

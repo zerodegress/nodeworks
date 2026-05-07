@@ -40,10 +40,16 @@ import java.util.UUID
  * - Flat inventory array with O(1) side-to-slot mapping
  * - Only marks dirty on actual changes
  */
-class NodeBlockEntity(
+open class NodeBlockEntity(
+    type: net.minecraft.world.level.block.entity.BlockEntityType<*>,
     pos: BlockPos,
-    state: BlockState
-) : BlockEntity(ModBlockEntities.NODE, pos, state), WorldlyContainer, damien.nodeworks.network.Connectable {
+    state: BlockState,
+) : BlockEntity(type, pos, state), WorldlyContainer, damien.nodeworks.network.Connectable {
+
+    /** Convenience constructor used by the regular Node block entity registration.
+     *  Subclasses (e.g. Advanced Node) call the [BlockEntityType]-taking primary
+     *  constructor so they can pass their own type. */
+    constructor(pos: BlockPos, state: BlockState) : this(ModBlockEntities.NODE, pos, state)
 
     companion object {
         private val logger = LoggerFactory.getLogger("nodeworks-node")
@@ -66,7 +72,15 @@ class NodeBlockEntity(
     }
 
     private val items: NonNullList<ItemStack> = NonNullList.withSize(TOTAL_SLOTS, ItemStack.EMPTY)
-    private val connections: LinkedHashSet<BlockPos> = linkedSetOf()
+    // Regular Nodes connect via face-adjacency only and never populate this
+    // set, but the [Focus Node][damien.nodeworks.block.entity.FocusNodeBlockEntity]
+    // subclass uses it for laser links. `protected` so the subclass can write
+    // and persist it.
+    protected val connections: LinkedHashSet<BlockPos> = linkedSetOf()
+
+    /** Per-face wrench-block flags. Bit i = forced-blocked on
+     *  Direction.entries[i]. Persisted as a single int in NBT. */
+    private var forcedPipeBlockedMask: Int = 0
 
     /** Count of legacy per-face monitors read from an older save. The monitor-on-node
      *  system was removed in favour of the standalone [damien.nodeworks.block.MonitorBlock],
@@ -95,7 +109,7 @@ class NodeBlockEntity(
 
     // --- Network connections ---
 
-    override fun getConnections(): List<BlockPos> = connections.toList()
+    override fun getConnections(): Collection<BlockPos> = connections
 
     override fun hasConnection(pos: BlockPos): Boolean = pos in connections
 
@@ -109,6 +123,14 @@ class NodeBlockEntity(
         if (!connections.remove(pos)) return false
         markDirtyAndSync()
         return true
+    }
+
+    override fun forcedPipeBlocked(side: Direction): Boolean =
+        (forcedPipeBlockedMask shr side.ordinal) and 1 != 0
+
+    override fun toggleForcedPipeBlock(side: Direction) {
+        forcedPipeBlockedMask = forcedPipeBlockedMask xor (1 shl side.ordinal)
+        markDirtyAndSync()
     }
 
     private fun markDirtyAndSync() {
@@ -149,8 +171,41 @@ class NodeBlockEntity(
         return out
     }
 
-    /** Resolves all capabilities for this side based on inserted cards. */
+    /** Role of one face of this Node, derived from what's adjacent.
+     *
+     *  - [PIPE]: another Connectable BE is adjacent. The face is consumed by
+     *    the connection, no cards are valid here.
+     *  - [DEVICE]: a non-Connectable block is adjacent (vanilla chest, furnace,
+     *    stone, ...). Cards on this face manage that adjacent block, current
+     *    behaviour.
+     *  - [FREE]: air is adjacent. Cards are allowed but most have no effect
+     *    without a block to target. Observer Cards into air are a legitimate
+     *    use case so we don't gate placement here. */
+    enum class FaceRole { PIPE, DEVICE, FREE }
+
+    fun faceRole(side: Direction): FaceRole {
+        val lvl = level ?: return FaceRole.FREE
+        val neighborPos = worldPosition.relative(side)
+        val neighborBe = lvl.getBlockEntity(neighborPos)
+        val neighborConnectable = neighborBe as? damien.nodeworks.network.Connectable
+        // Wrench force-block on either side demotes the face out of PIPE so
+        // the player gets card slots back on a face they cut off. Mirrors the
+        // gate in [NodeBlock.computePipeFlag] so the GUI state agrees with
+        // what the renderer is showing.
+        if (neighborConnectable != null
+            && !forcedPipeBlocked(side)
+            && !neighborConnectable.forcedPipeBlocked(side.opposite)
+        ) return FaceRole.PIPE
+        val neighborState = lvl.getBlockState(neighborPos)
+        if (neighborState.isAir) return FaceRole.FREE
+        return FaceRole.DEVICE
+    }
+
+    /** Resolves all capabilities for this side based on inserted cards.
+     *  Returns [emptyList] for PIPE-roled faces, the face is consumed by the
+     *  network connection and any cards stashed there don't expose a target. */
     fun getSideCapabilities(side: Direction): List<SideCapabilityInfo> {
+        if (faceRole(side) == FaceRole.PIPE) return emptyList()
         val adjacentPos = worldPosition.relative(side)
         val accessFace = side.opposite // face of the target block that faces the node
         return getCards(side).map { info ->
@@ -163,8 +218,12 @@ class NodeBlockEntity(
                     val filterRules = damien.nodeworks.card.StorageCard.getFilterRules(stack)
                     val stackability = damien.nodeworks.card.StorageCard.getStackabilityFilter(stack)
                     val nbtFilter = damien.nodeworks.card.StorageCard.getNbtFilter(stack)
+                    // Player-chosen side override resolves against the card's
+                    // mounted node face. Null = use the default touching-face.
+                    val customSide = damien.nodeworks.card.StorageCard.getCustomSide(stack)
+                    val resolvedFace = customSide?.resolve(side) ?: accessFace
                     StorageSideCapability(
-                        adjacentPos, accessFace, priority,
+                        adjacentPos, resolvedFace, priority,
                         filterMode, filterRules, stackability, nbtFilter,
                     )
                 }
@@ -201,6 +260,7 @@ class NodeBlockEntity(
     fun setStack(side: Direction, slot: Int, stack: ItemStack) {
         require(slot in 0 until SLOTS_PER_SIDE) { "Slot $slot out of range for side" }
         items[sideOffset(side) + slot] = stack
+        clearRedstoneIfNoCard(side)
         markDirtyAndSync()
     }
 
@@ -214,16 +274,22 @@ class NodeBlockEntity(
 
     override fun removeItem(slot: Int, amount: Int): ItemStack {
         val result = ContainerHelper.removeItem(items, slot, amount)
-        if (!result.isEmpty) markDirtyAndSync()
+        if (!result.isEmpty) {
+            clearRedstoneIfNoCard(sideForSlot(slot))
+            markDirtyAndSync()
+        }
         return result
     }
 
     override fun removeItemNoUpdate(slot: Int): ItemStack {
-        return ContainerHelper.takeItem(items, slot)
+        val taken = ContainerHelper.takeItem(items, slot)
+        if (!taken.isEmpty) clearRedstoneIfNoCard(sideForSlot(slot))
+        return taken
     }
 
     override fun setItem(slot: Int, stack: ItemStack) {
         items[slot] = stack
+        clearRedstoneIfNoCard(sideForSlot(slot))
         markDirtyAndSync()
     }
 
@@ -233,7 +299,22 @@ class NodeBlockEntity(
 
     override fun clearContent() {
         items.clear()
+        for (dir in Direction.entries) clearRedstoneIfNoCard(dir)
         markDirtyAndSync()
+    }
+
+    private fun sideForSlot(slot: Int): Direction = Direction.entries[slot / SLOTS_PER_SIDE]
+
+    /** Drop the side's emitted redstone strength when no Redstone Card remains
+     *  in any of its slots, so pulling the card kills the signal it was driving. */
+    private fun clearRedstoneIfNoCard(side: Direction) {
+        if (redstoneOutputs[side.ordinal] == 0) return
+        val offset = sideOffset(side)
+        for (i in 0 until SLOTS_PER_SIDE) {
+            val stack = items[offset + i]
+            if (stack.item is damien.nodeworks.card.RedstoneCard) return
+        }
+        setRedstoneOutput(side, 0)
     }
 
     // --- WorldlyContainer: controls which slots are accessible from each direction ---
@@ -249,6 +330,7 @@ class NodeBlockEntity(
     override fun canPlaceItemThroughFace(slot: Int, stack: ItemStack, side: Direction?): Boolean {
         if (side == null) return false
         if (stack.item !is NodeCard) return false
+        if (faceRole(side) == FaceRole.PIPE) return false
         val offset = sideOffset(side)
         return slot in offset until (offset + SLOTS_PER_SIDE)
     }
@@ -263,19 +345,24 @@ class NodeBlockEntity(
     override fun saveAdditional(output: ValueOutput) {
         super.saveAdditional(output)
         ContainerHelper.saveAllItems(output, items)
-        output.putBlockPosList("connections", connections)
+        // Pipe refactor: Node-side laser links are gone. We don't write the
+        // legacy "connections" key any more, networks form via face-adjacency.
         if (hasAnyRedstoneOutput()) {
             output.putIntArray("redstoneOutputs", redstoneOutputs.copyOf())
         }
         networkId?.let { output.putString("networkId", it.toString()) }
+        if (forcedPipeBlockedMask != 0) output.putInt("forcedPipeBlocked", forcedPipeBlockedMask)
     }
 
     override fun loadAdditional(input: ValueInput) {
         super.loadAdditional(input)
         items.clear()
         ContainerHelper.loadAllItems(input, items)
+        // Pipe refactor migration: discard any persisted laser links, the
+        // network is rebuilt from adjacency on the next propagate. Old saves
+        // with non-adjacent wrenched-link networks will silently lose those
+        // links, players reconfigure with pipes.
         connections.clear()
-        connections.addAll(input.getBlockPosList("connections"))
         redstoneOutputs.fill(0)
         input.getIntArray("redstoneOutputs").ifPresent { saved ->
             for (i in 0 until minOf(saved.size, 6)) {
@@ -285,6 +372,7 @@ class NodeBlockEntity(
         networkId = input.getStringOrNull("networkId")?.takeIf { it.isNotEmpty() }?.let {
             try { UUID.fromString(it) } catch (_: Exception) { null }
         }
+        forcedPipeBlockedMask = input.getIntOr("forcedPipeBlocked", 0) and 0x3F
         damien.nodeworks.network.NetworkSettingsRegistry.notifyConnectableChanged(networkId)
         nodeTracker?.onNodeChanged(worldPosition, true)
 
@@ -299,7 +387,6 @@ class NodeBlockEntity(
     override fun setLevel(newLevel: net.minecraft.world.level.Level) {
         super.setLevel(newLevel)
         if (newLevel is net.minecraft.server.level.ServerLevel) {
-            NodeConnectionHelper.trackNode(newLevel, worldPosition)
             NodeConnectionHelper.queueRevalidation(newLevel, worldPosition)
             // Legacy migration: drop one Monitor item per legacy per-face monitor
             // recorded on this node. The drop happens once (`legacyMonitorDrops` is
@@ -324,6 +411,38 @@ class NodeBlockEntity(
                     )
                 }
             }
+            // Pipe-refactor migration: drop any cards that sit on a face which
+            // is now PIPE-roled (touching another Connectable). Same execute()
+            // delay as the monitor migration since dropItemStack mid-load is
+            // unsafe. Faces that gain PIPE role mid-game (because a Connectable
+            // gets placed adjacent) keep their cards inert until the player
+            // breaks one of the blocks, the migration only fires on load.
+            newLevel.server.execute {
+                if (!newLevel.isLoaded(worldPosition)) return@execute
+                var dropped = 0
+                for (dir in Direction.entries) {
+                    if (faceRole(dir) != FaceRole.PIPE) continue
+                    val offset = sideOffset(dir)
+                    for (slotIdx in 0 until SLOTS_PER_SIDE) {
+                        val stack = items[offset + slotIdx]
+                        if (stack.isEmpty) continue
+                        net.minecraft.world.Containers.dropItemStack(
+                            newLevel,
+                            worldPosition.x + 0.5, worldPosition.y + 0.5, worldPosition.z + 0.5,
+                            stack.copy(),
+                        )
+                        items[offset + slotIdx] = ItemStack.EMPTY
+                        dropped++
+                    }
+                }
+                if (dropped > 0) {
+                    setChanged()
+                    logger.info(
+                        "Dropped $dropped card(s) from now-pipe faces on node at {} (pipe-refactor migration).",
+                        worldPosition,
+                    )
+                }
+            }
         }
     }
 
@@ -331,22 +450,11 @@ class NodeBlockEntity(
     override var blockDestroyed: Boolean = false
     override var networkId: UUID? = null
 
-    /** Nodes don't bridge networks through face-adjacency, only via lasers. The
-     *  Node is a small fixture inside the block so adjacency through it would be
-     *  invisible to the player. */
-    override fun usesAdjacency(): Boolean = false
-
-    /** Nodes auto-splice into existing lasers when placed on the line. Lets a
-     *  player extend a network by dropping a Node onto an active laser without
-     *  having to manually disconnect and reconnect. */
-    override fun autoSpliceOnPlace(): Boolean = true
-
     override fun setRemoved() {
         nodeTracker?.onNodeChanged(worldPosition, false)
         val currentLevel = level
         if (currentLevel is net.minecraft.server.level.ServerLevel) {
             NodeConnectionHelper.removeAllConnections(currentLevel, this)
-            NodeConnectionHelper.untrackNode(currentLevel, worldPosition)
         }
         super.setRemoved()
     }

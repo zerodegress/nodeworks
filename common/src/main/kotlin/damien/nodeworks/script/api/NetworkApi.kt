@@ -58,7 +58,9 @@ val NetworkApi: ApiSurface = api(Network) {
         param("name", NetworkName, description = "Name of a card, variable, breaker, or placer on this network.")
         returns(Any)
         description =
-            "Returns the card, variable, breaker, or placer with this name. Errors if no match. Cards win on collision."
+            "Returns the card, variable, breaker, or placer with this name. Errors if no match. Cards win on collision. " +
+            "The returned handle binds to the entity's slot at lookup time, calling methods on it after the card or " +
+            "device is removed or moved throws. Re-fetch via `network:get` to follow renames."
         guidebookRef = "nodeworks:lua-api/network.md#get"
     }
 
@@ -211,6 +213,45 @@ val ChannelApi: ApiSurface = api(Channel) {
         returns(CardHandle)
         description = "Alias lookup scoped to this channel. Errors if no match exists."
         guidebookRef = "nodeworks:lua-api/channel.md#get"
+    }
+
+    method("find") {
+        param("filter", Filter, description = "Resource filter, see Filter for syntax.")
+        returns(ItemsHandle.optional())
+        description =
+            "Scans this channel's storage cards for matching items or fluids. Returns an aggregated handle, or nil if nothing matches."
+        guidebookRef = "nodeworks:lua-api/channel.md#find"
+    }
+
+    method("findEach") {
+        param("filter", Filter, description = "Resource filter, see Filter for syntax.")
+        returns(ItemsHandle.list())
+        description = "Returns a separate handle for every distinct resource on this channel matching the filter."
+        guidebookRef = "nodeworks:lua-api/channel.md#findEach"
+    }
+
+    method("count") {
+        param("filter", Filter, description = "Resource filter.")
+        returns(Number)
+        description = "Total quantity in this channel's storage matching the filter. Fluids count in mB."
+        guidebookRef = "nodeworks:lua-api/channel.md#count"
+    }
+
+    method("insert") {
+        param("items", ItemsHandle, description = "Resource to move from its source into this channel's storage.")
+        param("count", Number.optional(), description = "Optional count limit, defaults to the items handle's full count.")
+        returns(Boolean)
+        description =
+            "Moves the full count from the handle's source into this channel's storage cards, or moves nothing. Returns true on success."
+        guidebookRef = "nodeworks:lua-api/channel.md#insert"
+    }
+
+    method("tryInsert") {
+        param("items", ItemsHandle, description = "Resource to move from its source into this channel's storage.")
+        param("count", Number.optional(), description = "Optional count limit.")
+        returns(Number)
+        description = "Best-effort move into this channel's storage. Returns the count actually moved."
+        guidebookRef = "nodeworks:lua-api/channel.md#tryInsert"
     }
 }
 

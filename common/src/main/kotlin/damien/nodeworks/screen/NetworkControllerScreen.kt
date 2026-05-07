@@ -55,6 +55,16 @@ class NetworkControllerScreen(
         private const val CHUNK_LOADING_OFFSET_X = 32
         private const val CHUNK_LOADING_BTN_W = 48
         private const val CHUNK_LOADING_BTN_H = 16
+
+        /** Retry stepper indent. Matches [CHUNK_LOADING_OFFSET_X] so the
+         *  [-]/field/[+] cluster aligns with the toggle column below it,
+         *  and clears the wider "Craft Retries" label that would otherwise
+         *  overlap the [-] button at the default [LABEL_W]. */
+        private const val RETRY_OFFSET_X = 32
+
+        /** Stepper button-to-field gap. 2 px matches the Import/Export
+         *  Chest tick steppers. */
+        private const val RETRY_STEPPER_GAP = 2
     }
 
     // Property definitions
@@ -67,11 +77,20 @@ class NetworkControllerScreen(
     private val properties = listOf(
         Property("Name", PropertyType.NAME),
         Property("Color", PropertyType.COLOR),
-        Property("Redstone", PropertyType.REDSTONE),
-        Property("Node Glow", PropertyType.GLOW_STYLE),
-        Property("Retries", PropertyType.HANDLER_RETRY),
+        // "Redstone" mode has no consumer, the controller's redstoneMode field
+        // is set/persisted/synced but never gates any behaviour. Hidden until
+        // a real use lands. REDSTONE rendering / click / payload kept intact
+        // below so re-adding the row is one-line.
+        // Property("Redstone", PropertyType.REDSTONE),
+        // "Node Glow" is hidden for now while the visual design is in flux.
+        // GLOW_STYLE rendering / click handling / payload plumbing stays intact
+        // below so re-adding the row is one-line.
+        // Property("Node Glow", PropertyType.GLOW_STYLE),
+        Property("Craft Retries", PropertyType.HANDLER_RETRY),
         Property("Chunk Loading", PropertyType.CHUNK_LOADING),
-        Property("Show Lasers", PropertyType.LASER_ENABLE),
+        // "Show Lasers" toggle removed in the pipe-based architecture, lasers
+        // aren't part of the connectivity model anymore. LASER_ENABLE render +
+        // click + payload kept below in case it's reinstated; just no row.
         Property("Fancy Lasers", PropertyType.LASER_MODE),
     )
 
@@ -110,6 +129,7 @@ class NetworkControllerScreen(
         nameField.setMaxLength(32)
         nameField.value = menu.initialName
         nameField.setBordered(true)
+        nameField.setHint(Component.literal("Network name").withStyle(net.minecraft.ChatFormatting.DARK_GRAY))
         addRenderableWidget(nameField)
 
         // Retry limit field, digits only, positioned dynamically between - / + buttons.
@@ -320,14 +340,17 @@ class NetworkControllerScreen(
         val btnH = 16
         val fieldW = 36
 
+        val minusX = bx + RETRY_OFFSET_X
+        val fieldX = minusX + btnW + RETRY_STEPPER_GAP
+        val plusX = fieldX + fieldW + RETRY_STEPPER_GAP
+
         // "-" button
-        val minusHovered = mouseX >= bx && mouseX < bx + btnW && mouseY >= by && mouseY < by + btnH
-        (if (minusHovered) NineSlice.BUTTON_HOVER else NineSlice.BUTTON).draw(graphics, bx, by, btnW, btnH)
+        val minusHovered = mouseX >= minusX && mouseX < minusX + btnW && mouseY >= by && mouseY < by + btnH
+        (if (minusHovered) NineSlice.BUTTON_HOVER else NineSlice.BUTTON).draw(graphics, minusX, by, btnW, btnH)
         val minusLabel = "-"
-        graphics.drawString(font, minusLabel, bx + (btnW - font.width(minusLabel)) / 2, by + 4, 0xFFDDDDDD.toInt())
+        graphics.drawString(font, minusLabel, minusX + (btnW - font.width(minusLabel)) / 2, by + 4, 0xFFDDDDDD.toInt())
 
         // EditBox position + visibility, sync value from menu when not focused.
-        val fieldX = bx + btnW + 4
         retryField.setX(fieldX)
         retryField.setY(by)
         retryField.width = fieldW
@@ -339,7 +362,6 @@ class NetworkControllerScreen(
         }
 
         // "+" button
-        val plusX = fieldX + fieldW + 4
         val plusHovered = mouseX >= plusX && mouseX < plusX + btnW && mouseY >= by && mouseY < by + btnH
         (if (plusHovered) NineSlice.BUTTON_HOVER else NineSlice.BUTTON).draw(graphics, plusX, by, btnW, btnH)
         val plusLabel = "+"
@@ -412,7 +434,7 @@ class NetworkControllerScreen(
             if (keyCode == 256) return super.keyPressed(event) // ESC
             if (keyCode == 257) { // ENTER, apply name
                 sendNameUpdate(this.nameField.value)
-                this.nameField.isFocused = false
+                clearNameFocus()
                 nameCheckmarkTime = net.minecraft.client.Minecraft.getInstance().level?.gameTime ?: 0
                 return true
             }
@@ -423,7 +445,7 @@ class NetworkControllerScreen(
             if (keyCode == 256) return super.keyPressed(event) // ESC
             if (keyCode == 257) { // ENTER, commit retries
                 commitRetryField()
-                this.retryField.isFocused = false
+                clearRetryFocus()
                 return true
             }
             this.retryField.keyPressed(event)
@@ -449,7 +471,7 @@ class NetworkControllerScreen(
             val inNameField = mx >= controlX && mx < controlX + 100 && my >= controlY && my < controlY + 16
             val inSetBtn = mx >= setBtnX && mx < setBtnX + setBtnW && my >= controlY && my < controlY + 16
             if (!inNameField && !inSetBtn) {
-                nameField.isFocused = false
+                clearNameFocus()
             }
         }
 
@@ -471,6 +493,7 @@ class NetworkControllerScreen(
             when (prop.type) {
                 PropertyType.COLOR -> {
                     if (mx >= controlX && mx < controlX + 16 && my >= controlY && my < controlY + 16) {
+                        playClickSound()
                         minecraft?.setScreen(ColorPickerScreen(this, menu.networkColor, DEFAULT_COLOR) { color ->
                             sendColorUpdate(color)
                         })
@@ -483,6 +506,7 @@ class NetworkControllerScreen(
                     val bh = 16
                     if (mx >= controlX && mx < controlX + bw && my >= controlY && my < controlY + bh) {
                         sendRedstoneUpdate((menu.redstoneMode + 1) % 3)
+                        playClickSound()
                         return true
                     }
                 }
@@ -494,6 +518,7 @@ class NetworkControllerScreen(
                         val bx = controlX + j * (btnW + 2)
                         if (mx >= bx && mx < bx + btnW && my >= controlY && my < controlY + btnH) {
                             sendGlowStyleUpdate(j)
+                            playClickSound()
                             return true
                         }
                     }
@@ -505,23 +530,30 @@ class NetworkControllerScreen(
                     val fieldW = 36
                     val step = if (hasShiftDownCompat()) 50 else 10
                     val current = menu.handlerRetryLimit
-                    val fieldX = controlX + btnW + 4
-                    val plusX = fieldX + fieldW + 4
-                    // Clicking outside the EditBox while it's focused commits current value.
+                    val minusX = controlX + RETRY_OFFSET_X
+                    val fieldX = minusX + btnW + RETRY_STEPPER_GAP
+                    val plusX = fieldX + fieldW + RETRY_STEPPER_GAP
+                    // Clicking outside the EditBox while it's focused commits + defocuses.
+                    // Routes through setFocused(null) so vanilla's equality short-circuit
+                    // doesn't block re-focusing on the next click. Same shape clearNameFocus
+                    // uses below.
                     val inField = mx >= fieldX && mx < fieldX + fieldW && my >= controlY && my < controlY + btnH
                     if (retryField.isFocused && !inField) {
                         commitRetryField()
+                        clearRetryFocus()
                     }
                     // Minus
-                    if (mx >= controlX && mx < controlX + btnW && my >= controlY && my < controlY + btnH) {
+                    if (mx >= minusX && mx < minusX + btnW && my >= controlY && my < controlY + btnH) {
                         val next = (current - step).coerceAtLeast(0)
                         if (next != current) sendHandlerRetryUpdate(next)
+                        playClickSound()
                         return true
                     }
                     // Plus
                     if (mx >= plusX && mx < plusX + btnW && my >= controlY && my < controlY + btnH) {
                         val next = (current + step).coerceAtMost(500)
                         if (next != current) sendHandlerRetryUpdate(next)
+                        playClickSound()
                         return true
                     }
                 }
@@ -532,13 +564,9 @@ class NetworkControllerScreen(
                     val setBtnH = 16
                     if (mx >= setBtnX && mx < setBtnX + setBtnW && my >= controlY && my < controlY + setBtnH) {
                         sendNameUpdate(this.nameField.value)
-                        nameField.isFocused = false
+                        clearNameFocus()
                         nameCheckmarkTime = net.minecraft.client.Minecraft.getInstance().level?.gameTime ?: 0
-                        minecraft?.player?.playSound(
-                            net.minecraft.sounds.SoundEvents.UI_BUTTON_CLICK.value(),
-                            0.5f,
-                            1.0f
-                        )
+                        playClickSound()
                         return true
                     }
                 }
@@ -548,6 +576,7 @@ class NetworkControllerScreen(
                     if (mx >= btnX && mx < btnX + CHUNK_LOADING_BTN_W
                         && my >= controlY && my < controlY + CHUNK_LOADING_BTN_H) {
                         sendChunkLoadingUpdate(!menu.chunkLoading)
+                        playClickSound()
                         return true
                     }
                 }
@@ -557,6 +586,7 @@ class NetworkControllerScreen(
                     if (mx >= btnX && mx < btnX + CHUNK_LOADING_BTN_W
                         && my >= controlY && my < controlY + CHUNK_LOADING_BTN_H) {
                         sendLaserEnableUpdate(!menu.laserEnabled)
+                        playClickSound()
                         return true
                     }
                 }
@@ -570,6 +600,7 @@ class NetworkControllerScreen(
                         else
                             damien.nodeworks.network.NetworkSettingsRegistry.LASER_MODE_FANCY
                         sendLaserModeUpdate(next)
+                        playClickSound()
                         return true
                     }
                 }
@@ -619,6 +650,29 @@ class NetworkControllerScreen(
         super.removed()
         sendNameUpdate(nameField.value)
         commitRetryField()
+    }
+
+    /** Drop focus from the name field. Routes through [setFocused(null)] when
+     *  the screen still considers the field focused; otherwise just clears
+     *  the EditBox's local flag. Without [setFocused(null)] the screen keeps
+     *  `focused = nameField` after the EditBox's own flag is flipped, and
+     *  vanilla's [setFocused] equality short-circuit blocks re-focusing the
+     *  field on subsequent clicks. */
+    private fun clearNameFocus() {
+        if (focused === nameField) setFocused(null) else nameField.isFocused = false
+    }
+
+    /** Same shape as [clearNameFocus] for the [retryField]. */
+    private fun clearRetryFocus() {
+        if (focused === retryField) setFocused(null) else retryField.isFocused = false
+    }
+
+    private fun playClickSound() {
+        net.minecraft.client.Minecraft.getInstance().soundManager.play(
+            net.minecraft.client.resources.sounds.SimpleSoundInstance.forUI(
+                net.minecraft.sounds.SoundEvents.UI_BUTTON_CLICK, 1.0f,
+            )
+        )
     }
 
     private fun sendColorUpdate(color: Int) {

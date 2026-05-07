@@ -23,12 +23,18 @@ object ModCreativeTab {
             .displayItems { _, output ->
                 // Blocks
                 output.accept(ModBlocks.NODE)
+                output.accept(ModBlocks.FOCUS_NODE)
+                output.accept(ModBlocks.PIPE)
                 output.accept(ModBlocks.NETWORK_CONTROLLER)
                 output.accept(ModBlocks.TERMINAL)
                 output.accept(ModBlocks.INVENTORY_TERMINAL)
+                output.accept(ModBlocks.DEVICE_FRAME)
                 output.accept(ModBlocks.VARIABLE)
                 output.accept(ModBlocks.BREAKER)
                 output.accept(ModBlocks.PLACER)
+                output.accept(ModBlocks.USER)
+                output.accept(ModBlocks.IMPORT_CHEST)
+                output.accept(ModBlocks.EXPORT_CHEST)
                 output.accept(ModBlocks.INSTRUCTION_STORAGE)
                 output.accept(ModBlocks.PROCESSING_STORAGE)
                 output.accept(ModBlocks.CRAFTING_CORE)
@@ -49,6 +55,7 @@ object ModCreativeTab {
                 output.accept(ModBlocks.SMALL_CELESTINE_BUD)
 
                 // Items
+                output.accept(ModItems.NODEWORKS_BOOK)
                 output.accept(ModItems.NETWORK_WRENCH)
                 output.accept(ModItems.DIAGNOSTIC_TOOL)
                 output.accept(ModItems.PORTABLE_INVENTORY_TERMINAL)

@@ -31,7 +31,44 @@ object NetworkDiscovery {
     private val activeProviderWalks: ThreadLocal<MutableSet<Pair<net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level>, BlockPos>>> =
         ThreadLocal.withInitial { mutableSetOf() }
 
+    /** Per-tick snapshot cache keyed by `(dimension, network UUID)`. Concurrent
+     *  because [Connectable.loadAdditional] runs on async chunk IO threads. */
+    private val cache: java.util.concurrent.ConcurrentHashMap<
+        Pair<net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level>, UUID>,
+        CachedSnapshot,
+    > = java.util.concurrent.ConcurrentHashMap()
+
+    private data class CachedSnapshot(val tick: Long, val snapshot: NetworkSnapshot)
+
+    fun invalidate(networkId: UUID) {
+        cache.entries.removeIf { it.key.second == networkId }
+    }
+
+    fun invalidateAll() {
+        cache.clear()
+    }
+
     fun discoverNetwork(level: ServerLevel, startPos: BlockPos): NetworkSnapshot {
+        val callerEntity = NodeConnectionHelper.getConnectable(level, startPos)
+        val callerId = callerEntity?.networkId
+        if (callerId != null) {
+            val cached = cache[level.dimension() to callerId]
+            if (cached != null && cached.tick == level.gameTime) return cached.snapshot
+        }
+
+        val snapshot = doDiscoverNetwork(level, startPos)
+
+        // Key by the resolved controller id (stable across conflicts) so all
+        // BEs on the network converge on the same cache entry regardless of
+        // which startPos was passed in.
+        val cacheId = snapshot.controller?.networkId ?: callerId
+        if (cacheId != null) {
+            cache[level.dimension() to cacheId] = CachedSnapshot(level.gameTime, snapshot)
+        }
+        return snapshot
+    }
+
+    private fun doDiscoverNetwork(level: ServerLevel, startPos: BlockPos): NetworkSnapshot {
         val visited = mutableSetOf<BlockPos>()
         val queue = ArrayDeque<BlockPos>()
         val nodes = mutableListOf<NodeSnapshot>()
@@ -40,6 +77,7 @@ object NetworkDiscovery {
         val variables = mutableListOf<VariableSnapshot>()
         val breakers = mutableListOf<BreakerSnapshot>()
         val placers = mutableListOf<PlacerSnapshot>()
+        val users = mutableListOf<UserSnapshot>()
         val processingApis = mutableListOf<ProcessingApiSnapshot>()
         val terminalPositions = mutableListOf<BlockPos>()
         var controller: ControllerSnapshot? = null
@@ -143,18 +181,33 @@ object NetworkDiscovery {
                         )
                     )
                 }
+                is damien.nodeworks.block.entity.UserBlockEntity -> {
+                    users.add(
+                        UserSnapshot(
+                            connectable.blockPos,
+                            connectable.deviceName.takeIf { it.isNotEmpty() },
+                            connectable.channel,
+                        )
+                    )
+                }
             }
 
             for (connection in connectable.getConnections()) {
                 if (connection in visited) continue
-                // Only mark visited after LOS passes, another path may have clear LOS
-                if (!NodeConnectionHelper.checkLineOfSight(level, pos, connection)) continue
+                if (!level.isLoaded(connection)) continue
+                if (level is net.minecraft.server.level.ServerLevel
+                    && NodeConnectionHelper.isPairBlocked(level, pos, connection)
+                ) continue
                 visited.add(connection)
                 queue.add(connection)
             }
             // Face-adjacent Connectables share the subgraph without a laser between
             // them. Both endpoints must opt in via [Connectable.usesAdjacency], so a
             // Node next to a Controller doesn't silently bridge two networks.
+            // Both endpoints must also accept the pair via [Connectable.canConnectAdjacentTo],
+            // so leaves like the import/export chests don't auto-bridge each other's
+            // networks just by sitting face-to-face. Mirrors the gate in
+            // [NodeConnectionHelper.adjacentConnectableNeighbors].
             if (connectable.usesAdjacency()) {
                 for (dir in Direction.entries) {
                     val adjPos = pos.relative(dir)
@@ -162,6 +215,10 @@ object NetworkDiscovery {
                     if (!level.isLoaded(adjPos)) continue
                     val neighbor = level.getBlockEntity(adjPos) as? Connectable ?: continue
                     if (!neighbor.usesAdjacency()) continue
+                    if (!connectable.canConnectAdjacentTo(neighbor)) continue
+                    if (!neighbor.canConnectAdjacentTo(connectable)) continue
+                    if (connectable.forcedPipeBlocked(dir)) continue
+                    if (neighbor.forcedPipeBlocked(dir.opposite)) continue
                     visited.add(adjPos)
                     queue.add(adjPos)
                 }
@@ -169,11 +226,11 @@ object NetworkDiscovery {
         }
 
         // Auto-generate aliases for unnamed cards (e.g., io_1, io_2, storage_1) AND
-        // unnamed devices (breaker_1, placer_1, ...). Devices share the same counter
-        // namespace as cards so the alias prefix uniquely identifies the type.
-        assignAutoAliases(nodes, breakers, placers)
+        // unnamed devices (breaker_1, placer_1, user_1, ...). Devices share the same
+        // counter namespace as cards so the alias prefix uniquely identifies the type.
+        assignAutoAliases(nodes, breakers, placers, users)
 
-        return NetworkSnapshot(nodes, crafters, variables, breakers, placers, cpus, processingApis, terminalPositions, controller)
+        return NetworkSnapshot(nodes, crafters, variables, breakers, placers, users, cpus, processingApis, terminalPositions, controller)
     }
 
     /** Assign `<base>_N` auto-aliases so every card / breaker / placer on the
@@ -186,6 +243,7 @@ object NetworkDiscovery {
         nodes: List<NodeSnapshot>,
         breakers: List<BreakerSnapshot>,
         placers: List<PlacerSnapshot>,
+        users: List<UserSnapshot>,
     ) {
         val slots = mutableListOf<AliasSlot>()
         for (node in nodes) {
@@ -211,6 +269,13 @@ object NetworkDiscovery {
                 literalName = p.name,
                 baseWhenUnnamed = autoAliasPrefix("placer"),
                 setAutoAlias = { p.autoAlias = it },
+            ))
+        }
+        for (u in users) {
+            slots.add(AliasSlot(
+                literalName = u.name,
+                baseWhenUnnamed = autoAliasPrefix("user"),
+                setAutoAlias = { u.autoAlias = it },
             ))
         }
         assignAliasSuffixes(slots)
@@ -281,6 +346,15 @@ data class PlacerSnapshot(
     val effectiveAlias: String get() = autoAlias ?: name ?: "placer"
 }
 
+data class UserSnapshot(
+    val pos: BlockPos,
+    val name: String?,
+    val channel: net.minecraft.world.item.DyeColor = net.minecraft.world.item.DyeColor.WHITE,
+) {
+    var autoAlias: String? = null
+    val effectiveAlias: String get() = autoAlias ?: name ?: "user"
+}
+
 data class ProcessingApiSnapshot(
     val pos: BlockPos,
     val apis: List<ProcessingStorageBlockEntity.ProcessingApiInfo>,
@@ -300,6 +374,7 @@ data class NetworkSnapshot(
     val variables: List<VariableSnapshot> = emptyList(),
     val breakers: List<BreakerSnapshot> = emptyList(),
     val placers: List<PlacerSnapshot> = emptyList(),
+    val users: List<UserSnapshot> = emptyList(),
     val cpus: List<CpuSnapshot> = emptyList(),
     val processingApis: List<ProcessingApiSnapshot> = emptyList(),
     val terminalPositions: List<BlockPos> = emptyList(),
@@ -318,6 +393,15 @@ data class NetworkSnapshot(
      *  in cards rather than O(N × ops). */
     private val flattenedCards: List<CardSnapshot> by lazy {
         nodes.flatMap { node -> node.sides.values.flatten() }
+    }
+
+    /** Storage cards on this network, sorted by priority (descending). Lazy
+     *  because [damien.nodeworks.script.NetworkStorageHelper.getStorageCards]
+     *  is called many times per Lua command and per device tick. */
+    val storageCards: List<CardSnapshot> by lazy {
+        flattenedCards
+            .filter { it.capability is damien.nodeworks.card.StorageSideCapability }
+            .sortedByDescending { (it.capability as damien.nodeworks.card.StorageSideCapability).priority }
     }
 
     /** Alias → card lookup, populated on first read. The literal [CardSnapshot.alias]
@@ -346,6 +430,13 @@ data class NetworkSnapshot(
         map
     }
 
+    private val userByAlias: Map<String, UserSnapshot> by lazy {
+        val map = HashMap<String, UserSnapshot>(users.size * 2)
+        for (u in users) u.name?.let { map.putIfAbsent(it, u) }
+        for (u in users) map.putIfAbsent(u.effectiveAlias, u)
+        map
+    }
+
     /** Find a variable by name. */
     fun findVariable(name: String): VariableSnapshot? = variables.firstOrNull { it.name == name }
 
@@ -359,6 +450,9 @@ data class NetworkSnapshot(
     /** Find a Placer by alias. Same literal-first / auto-suffixed-fallback rule
      *  as [findBreaker]. */
     fun findPlacer(alias: String): PlacerSnapshot? = placerByAlias[alias]
+
+    /** Find a User by alias. Same resolution rule as [findBreaker] / [findPlacer]. */
+    fun findUser(alias: String): UserSnapshot? = userByAlias[alias]
 
     /** Find an available (not busy) Crafting CPU with enough buffer capacity. */
     fun findAvailableCpu(requiredCapacity: Long = 0L): CpuSnapshot? =

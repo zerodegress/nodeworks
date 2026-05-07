@@ -5,18 +5,24 @@ import damien.nodeworks.platform.ClientNetworkingService
 import damien.nodeworks.platform.PlatformServices
 import damien.nodeworks.registry.ModScreenHandlers
 import damien.nodeworks.registry.ModBlockEntities
+import damien.nodeworks.render.BreakerRenderer
 import damien.nodeworks.render.ControllerRenderer
 import damien.nodeworks.render.CoProcessorRenderer
 import damien.nodeworks.render.CraftingCoreRenderer
 import damien.nodeworks.render.CraftingStorageRenderer
+import damien.nodeworks.render.ExportChestRenderer
+import damien.nodeworks.render.ImportChestRenderer
 import damien.nodeworks.render.InstructionStorageRenderer
 import damien.nodeworks.render.InventoryTerminalRenderer
 import damien.nodeworks.render.MonitorRenderer
 import damien.nodeworks.render.NodeConnectionRenderer
 import damien.nodeworks.render.NodeRenderer
+import damien.nodeworks.render.PipeRenderer
+import damien.nodeworks.render.PlacerRenderer
 import damien.nodeworks.render.ProcessingStorageRenderer
 import damien.nodeworks.render.ReceiverAntennaRenderer
 import damien.nodeworks.render.TerminalRenderer
+import damien.nodeworks.render.UserRenderer
 import damien.nodeworks.render.VariableRenderer
 import net.neoforged.neoforge.client.event.EntityRenderersEvent
 import damien.nodeworks.screen.NodeSideScreen
@@ -48,6 +54,7 @@ object NeoForgeClientSetup {
         modBus.addListener(::onRegisterSelectItemModelProperties)
         modBus.addListener(::onRegisterItemTintSources)
         modBus.addListener(::onRegisterRenderPipelines)
+        modBus.addListener(::onRegisterStandaloneModels)
 
         // Register the in-game guide synchronously during mod construction, NOT inside
         // FMLClientSetupEvent.enqueueWork. GuideME hooks the item-tooltip "Hold G" hint
@@ -117,26 +124,75 @@ object NeoForgeClientSetup {
 
             NodeConnectionRenderer.register()
             damien.nodeworks.render.CardPlacementPreviewRenderer.init()
+            damien.nodeworks.render.UserPreviewRenderer.init()
         }
     }
 
     private fun onRegisterRenderers(event: EntityRenderersEvent.RegisterRenderers) {
-        event.registerBlockEntityRenderer(ModBlockEntities.NODE, ::NeoNodeRenderer)
-        event.registerBlockEntityRenderer(ModBlockEntities.MONITOR, ::NeoMonitorRenderer)
-        event.registerBlockEntityRenderer(ModBlockEntities.NETWORK_CONTROLLER, ::NeoControllerRenderer)
-        event.registerBlockEntityRenderer(ModBlockEntities.VARIABLE, ::NeoVariableRenderer)
-        event.registerBlockEntityRenderer(ModBlockEntities.TERMINAL, ::NeoTerminalRenderer)
-        event.registerBlockEntityRenderer(ModBlockEntities.PROCESSING_STORAGE, ::NeoProcessingStorageRenderer)
-        event.registerBlockEntityRenderer(ModBlockEntities.INSTRUCTION_STORAGE, ::NeoInstructionStorageRenderer)
-        event.registerBlockEntityRenderer(ModBlockEntities.RECEIVER_ANTENNA, ::NeoReceiverAntennaRenderer)
-        event.registerBlockEntityRenderer(ModBlockEntities.CRAFTING_CORE, ::NeoCraftingCoreRenderer)
+        // Direct registration without the laser-bounding-box wrappers, all neighbours
+        // are now visible via adjacency, no off-screen-laser-visibility concern.
+        event.registerBlockEntityRenderer(ModBlockEntities.NODE, ::NodeRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.FOCUS_NODE, ::FocusNodeRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.PIPE, ::PipeRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.MONITOR, ::MonitorRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.NETWORK_CONTROLLER, ::ControllerRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.VARIABLE, ::VariableRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.TERMINAL, ::TerminalRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.PROCESSING_STORAGE, ::ProcessingStorageRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.INSTRUCTION_STORAGE, ::InstructionStorageRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.RECEIVER_ANTENNA, ::ReceiverAntennaRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.CRAFTING_CORE, ::CraftingCoreRenderer)
         event.registerBlockEntityRenderer(ModBlockEntities.CRAFTING_STORAGE, ::CraftingStorageRenderer)
         event.registerBlockEntityRenderer(ModBlockEntities.CO_PROCESSOR, ::CoProcessorRenderer)
-        event.registerBlockEntityRenderer(ModBlockEntities.INVENTORY_TERMINAL, ::NeoInventoryTerminalRenderer)
-        event.registerBlockEntityRenderer(ModBlockEntities.BREAKER, ::NeoBreakerRenderer)
-        event.registerBlockEntityRenderer(ModBlockEntities.PLACER, ::NeoPlacerRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.INVENTORY_TERMINAL, ::InventoryTerminalRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.BREAKER, ::BreakerRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.PLACER, ::PlacerRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.USER, ::UserRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.IMPORT_CHEST, ::ImportChestRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.EXPORT_CHEST, ::ExportChestRenderer)
         event.registerEntityRenderer(damien.nodeworks.registry.ModEntityTypes.MILKY_SOUL_BALL) { ctx ->
             net.minecraft.client.renderer.entity.ThrownItemRenderer(ctx)
+        }
+    }
+
+    /** Standalone-model registration. The User device's arm geometry comes
+     *  from `models/block/user_arm.json` so it can be edited in Blockbench
+     *  without touching code. NeoForge's standalone-model system handles
+     *  loading + baking; the renderer fetches the result via [UserArmModel]'s
+     *  fetcher lambda which we wire up to the live ModelManager here. */
+    private val USER_ARM_MODEL_KEY: net.neoforged.neoforge.client.model.standalone.StandaloneModelKey<net.minecraft.client.renderer.block.dispatch.BlockStateModelPart> =
+        net.neoforged.neoforge.client.model.standalone.StandaloneModelKey { "nodeworks:user_arm" }
+
+    /** Emissive overlay model. Inherits geometry from `nodeworks:block/user`
+     *  via JSON parent and only swaps `#0` to user_emissive.png, so any
+     *  face the artist paints in user_emissive.png lights up at the
+     *  network colour with the SAME per-face UV layout user.json uses. */
+    private val USER_EMISSIVE_MODEL_KEY: net.neoforged.neoforge.client.model.standalone.StandaloneModelKey<net.minecraft.client.renderer.block.dispatch.BlockStateModelPart> =
+        net.neoforged.neoforge.client.model.standalone.StandaloneModelKey { "nodeworks:user_emissive" }
+
+    private fun onRegisterStandaloneModels(
+        event: net.neoforged.neoforge.client.event.ModelEvent.RegisterStandalone
+    ) {
+        val armId = net.minecraft.resources.Identifier.fromNamespaceAndPath("nodeworks", "block/user_arm")
+        event.register(
+            USER_ARM_MODEL_KEY,
+            net.neoforged.neoforge.client.model.standalone.SimpleUnbakedStandaloneModel.simpleModelWrapper(armId),
+        )
+        damien.nodeworks.client.UserArmModel.fetcher = {
+            net.minecraft.client.Minecraft.getInstance()
+                .modelManager
+                .getStandaloneModel(USER_ARM_MODEL_KEY)
+        }
+
+        val emissiveId = net.minecraft.resources.Identifier.fromNamespaceAndPath("nodeworks", "block/user_emissive")
+        event.register(
+            USER_EMISSIVE_MODEL_KEY,
+            net.neoforged.neoforge.client.model.standalone.SimpleUnbakedStandaloneModel.simpleModelWrapper(emissiveId),
+        )
+        damien.nodeworks.client.UserEmissiveModel.fetcher = {
+            net.minecraft.client.Minecraft.getInstance()
+                .modelManager
+                .getStandaloneModel(USER_EMISSIVE_MODEL_KEY)
         }
     }
 
@@ -234,6 +290,15 @@ object NeoForgeClientSetup {
         event.register(ModScreenHandlers.PLACER) { menu, inventory, title ->
             damien.nodeworks.screen.PlacerScreen(menu, inventory, title)
         }
+        event.register(ModScreenHandlers.IMPORT_CHEST) { menu, inventory, title ->
+            damien.nodeworks.screen.ImportChestScreen(menu, inventory, title)
+        }
+        event.register(ModScreenHandlers.EXPORT_CHEST) { menu, inventory, title ->
+            damien.nodeworks.screen.ExportChestScreen(menu, inventory, title)
+        }
+        event.register(ModScreenHandlers.USER) { menu, inventory, title ->
+            damien.nodeworks.screen.UserScreen(menu, inventory, title)
+        }
     }
 
     private fun onRegisterRenderPipelines(
@@ -246,6 +311,7 @@ object NeoForgeClientSetup {
         //  RenderSetup built around it.
         event.registerPipeline(damien.nodeworks.render.PinHighlightRenderType.THROUGH_WALLS_PIPELINE)
         event.registerPipeline(damien.nodeworks.render.CrystalCoreRenderType.CORE_PIPELINE)
+        event.registerPipeline(damien.nodeworks.render.PipeLaserCoreRenderType.PIPELINE)
     }
 
 }

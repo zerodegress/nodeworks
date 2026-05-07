@@ -3,13 +3,18 @@ package damien.nodeworks.registry
 import damien.nodeworks.block.InstructionStorageBlock
 import damien.nodeworks.block.InventoryTerminalBlock
 import damien.nodeworks.block.NetworkControllerBlock
+import damien.nodeworks.block.FocusNodeBlock
 import damien.nodeworks.block.NodeBlock
+import damien.nodeworks.block.PipeBlock
 import damien.nodeworks.block.TerminalBlock
 import damien.nodeworks.block.ProcessingStorageBlock
 import damien.nodeworks.block.AntennaSegmentBlock
 import damien.nodeworks.block.BreakerBlock
 import damien.nodeworks.block.BroadcastAntennaBlock
+import damien.nodeworks.block.ExportChestBlock
+import damien.nodeworks.block.ImportChestBlock
 import damien.nodeworks.block.PlacerBlock
+import damien.nodeworks.block.UserBlock
 import damien.nodeworks.block.CraftingCoreBlock
 import damien.nodeworks.block.CoProcessorBlock
 import damien.nodeworks.block.CraftingStorageBlock
@@ -33,6 +38,29 @@ object ModBlocks {
         ::NodeBlock,
         BlockBehaviour.Properties.of()
             .strength(2.0f, 6.0f)
+            .noOcclusion()
+            .requiresCorrectToolForDrops(),
+        // Node items only place by replacing an existing Pipe, see NodeBlockItem.
+        itemFactory = { block, props -> damien.nodeworks.item.NodeBlockItem(block, props) },
+    )
+
+    val FOCUS_NODE: Block = register(
+        "focus_node",
+        ::FocusNodeBlock,
+        BlockBehaviour.Properties.of()
+            .strength(3.0f, 8.0f)
+            .noOcclusion()
+            .requiresCorrectToolForDrops(),
+        // Reuses NodeBlockItem so the same swap-onto-Pipe / shift-place-adjacent
+        // behaviour applies. Standard placement still works on any block too.
+        itemFactory = { block, props -> damien.nodeworks.item.NodeBlockItem(block, props) },
+    )
+
+    val PIPE: Block = register(
+        "pipe",
+        ::PipeBlock,
+        BlockBehaviour.Properties.of()
+            .strength(1.5f, 4.0f)
             .noOcclusion()
             .requiresCorrectToolForDrops()
     )
@@ -106,6 +134,29 @@ object ModBlocks {
             .strength(3.0f, 6.0f)
             .requiresCorrectToolForDrops()
     )
+
+    val USER: Block = register(
+        "user",
+        ::UserBlock,
+        BlockBehaviour.Properties.of()
+            .strength(3.0f, 6.0f)
+            .requiresCorrectToolForDrops()
+    )
+
+    /** Crafting-only frame block. Combines the common ingredients shared by
+     *  the Variable / Breaker / Placer / User device recipes (deepslate
+     *  shell, node core, blank card, celestine shard) into one ingredient
+     *  so each device's recipe can drop the boilerplate and focus on its
+     *  device-specific parts. Has no in-world behaviour beyond placing as
+     *  a regular cube; the registry entry exists so it shows up in JEI and
+     *  the creative tab as a tangible craft target. */
+    val DEVICE_FRAME: Block = registerDirect(
+        "device_frame",
+        BlockBehaviour.Properties.of()
+            .strength(3.0f, 6.0f)
+            .sound(net.minecraft.world.level.block.SoundType.METAL)
+            .requiresCorrectToolForDrops()
+    ) { props -> net.minecraft.world.level.block.Block(props) }
 
     val CRAFTING_STORAGE: Block = register(
         "crafting_storage",
@@ -230,6 +281,27 @@ object ModBlocks {
         ::InventoryTerminalBlock,
         BlockBehaviour.Properties.of()
             .strength(3.0f, 6.0f)
+            .requiresCorrectToolForDrops()
+    )
+
+    /** Import Chest. Buffer + network input device. Uses copper sound type
+     *  to match the metallic visual planned for the texture. */
+    val IMPORT_CHEST: Block = register(
+        "import_chest",
+        ::ImportChestBlock,
+        BlockBehaviour.Properties.of()
+            .strength(3.0f, 6.0f)
+            .sound(net.minecraft.world.level.block.SoundType.COPPER)
+            .requiresCorrectToolForDrops()
+    )
+
+    /** Export Chest. Buffer + network output device. Mirror of [IMPORT_CHEST]. */
+    val EXPORT_CHEST: Block = register(
+        "export_chest",
+        ::ExportChestBlock,
+        BlockBehaviour.Properties.of()
+            .strength(3.0f, 6.0f)
+            .sound(net.minecraft.world.level.block.SoundType.COPPER)
             .requiresCorrectToolForDrops()
     )
 

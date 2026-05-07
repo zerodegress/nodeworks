@@ -56,6 +56,33 @@ class BreakerBlockEntity(
             markDirtyAndSync()
         }
 
+    /** Block-id / tag / pattern that gates the auto-break loop. Empty string
+     *  leaves the Breaker idle (Lua-only). When non-empty, [serverTick]
+     *  starts a break against the front block whenever its registry id
+     *  matches the filter and the [redstoneMode] gate allows it. */
+    var filterRule: String = ""
+        set(value) {
+            field = value
+            markDirtyAndSync()
+        }
+
+    var redstoneMode: Int = REDSTONE_IGNORED
+        set(value) {
+            field = value.coerceIn(0, 2)
+            markDirtyAndSync()
+        }
+
+    /** Toggles the [UserPreviewRenderer] wireframe over the single block at
+     *  [targetPos]. Persisted so preview survives chunk unload. */
+    var previewArea: Boolean = false
+        set(value) {
+            field = value
+            if (level?.isClientSide == true) {
+                damien.nodeworks.render.UserPreviewRenderer.TrackedBreakers.setPreview(this, value)
+            }
+            markDirtyAndSync()
+        }
+
     /** Tick counter for the in-progress break (0 = idle). When this reaches
      *  [breakDurationTicks] the block actually breaks, while `> 0`, the breaker
      *  pushes per-stage destroy-progress to the level so the vanilla crack overlay
@@ -100,6 +127,11 @@ class BreakerBlockEntity(
      *  to detect mid-break drift (player swap, world physics) and abort if so. */
     private var targetSnapshot: BlockState? = null
 
+    /** Last idle-tick we ran [tryAutoStart] on. Negative-init so the first
+     *  tick post-load always polls. */
+    @Transient
+    private var lastIdlePollTick: Long = -IDLE_POLL_INTERVAL_TICKS.toLong()
+
     /** Begin a break of the block at [targetPos]. No-op when already breaking, the
      *  target is air / unbreakable, or above-tier (silent, the API contract says
      *  diamond pickaxe equivalence is the cap). Returns true when a break actually
@@ -134,7 +166,17 @@ class BreakerBlockEntity(
 
     /** Per-tick advance. Called from [BreakerBlock.getTicker]'s server-side ticker. */
     fun serverTick(level: ServerLevel) {
-        if (!isBreaking) return
+        if (!isBreaking) {
+            // Idle: poll the front block on a [IDLE_POLL_INTERVAL_TICKS]
+            // cadence. The block at targetPos almost never changes between
+            // ticks, so running the registry lookup + filter regex every
+            // tick is wasted work. Lua-driven breaks ([BreakerHandle.break])
+            // bypass this path, they call startBreak directly.
+            if (level.gameTime - lastIdlePollTick < IDLE_POLL_INTERVAL_TICKS) return
+            lastIdlePollTick = level.gameTime
+            tryAutoStart(level)
+            return
+        }
 
         // Detect target drift, if the block has changed underneath us (player
         // swapped it, piston pushed something else into place), abort cleanly.
@@ -154,6 +196,34 @@ class BreakerBlockEntity(
 
         if (breakProgress >= breakDurationTicks) {
             completeBreak(level, target, current)
+        }
+    }
+
+    /** Filter + redstone gate check, fires [startBreak] when both pass and the
+     *  front block resolves to a registry id matching [filterRule]. Empty
+     *  filter is the explicit idle signal (no auto-break). */
+    private fun tryAutoStart(level: ServerLevel) {
+        if (filterRule.isEmpty()) return
+        // Ignored = script-only, mirrors UserBlockEntity. Auto-break stays off
+        // until the player switches to LOW or HIGH; Lua [BreakerHandle.mine]
+        // calls [startBreak] directly and bypasses this gate.
+        if (redstoneMode == REDSTONE_IGNORED) return
+        if (!redstoneAllows(level)) return
+        val target = targetPos
+        val state = level.getBlockState(target)
+        if (state.isAir) return
+        val blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.block).toString()
+        if (!damien.nodeworks.script.CardHandle.matchesFilter(blockId, filterRule)) return
+        startBreak(level, handler = null)
+    }
+
+    private fun redstoneAllows(level: ServerLevel): Boolean {
+        if (redstoneMode == REDSTONE_IGNORED) return true
+        val powered = level.hasNeighborSignal(worldPosition)
+        return when (redstoneMode) {
+            REDSTONE_LOW -> !powered
+            REDSTONE_HIGH -> powered
+            else -> true
         }
     }
 
@@ -223,7 +293,7 @@ class BreakerBlockEntity(
     }
 
     // --- Connectable ---
-    override fun getConnections(): Set<BlockPos> = connections.toSet()
+    override fun getConnections(): Set<BlockPos> = connections
     override fun addConnection(pos: BlockPos): Boolean {
         if (!connections.add(pos)) return false
         markDirtyAndSync()
@@ -243,11 +313,19 @@ class BreakerBlockEntity(
             NodeConnectionHelper.trackNode(level, worldPosition)
             NodeConnectionHelper.queueRevalidation(level, worldPosition)
         }
-        damien.nodeworks.render.NodeConnectionRenderer.trackConnectable(worldPosition, true)
+        // Client-only render trackers, see UserBlockEntity.setLevel for
+        // the rationale.
+        if (level.isClientSide) {
+            damien.nodeworks.render.NodeConnectionRenderer.trackConnectable(level, worldPosition, true)
+            damien.nodeworks.render.UserPreviewRenderer.TrackedBreakers.add(this)
+        }
     }
 
     override fun setRemoved() {
-        damien.nodeworks.render.NodeConnectionRenderer.trackConnectable(worldPosition, false)
+        if (level?.isClientSide == true) {
+            damien.nodeworks.render.NodeConnectionRenderer.trackConnectable(level, worldPosition, false)
+            damien.nodeworks.render.UserPreviewRenderer.TrackedBreakers.remove(worldPosition)
+        }
         val lvl = level
         if (lvl is ServerLevel) {
             // Wipe any leftover crack overlay if we're mid-break when the breaker is broken.
@@ -263,6 +341,9 @@ class BreakerBlockEntity(
         super.saveAdditional(output)
         output.putString("deviceName", deviceName)
         output.putInt("channel", channel.id)
+        output.putString("filterRule", filterRule)
+        output.putInt("redstoneMode", redstoneMode)
+        output.putBoolean("previewArea", previewArea)
         output.putInt("breakProgress", breakProgress)
         output.putInt("breakDurationTicks", breakDurationTicks)
         networkId?.let { output.putString("networkId", it.toString()) }
@@ -274,6 +355,9 @@ class BreakerBlockEntity(
         super.loadAdditional(input)
         deviceName = input.getStringOr("deviceName", "")
         channel = runCatching { DyeColor.byId(input.getIntOr("channel", 0)) }.getOrDefault(DyeColor.WHITE)
+        filterRule = input.getStringOr("filterRule", "")
+        redstoneMode = input.getIntOr("redstoneMode", REDSTONE_IGNORED).coerceIn(0, 2)
+        previewArea = input.getBooleanOr("previewArea", false)
         breakProgress = input.getIntOr("breakProgress", 0)
         breakDurationTicks = input.getIntOr("breakDurationTicks", 0)
         // pendingHandler intentionally not loaded, LuaFunction can't serialise.
@@ -296,6 +380,17 @@ class BreakerBlockEntity(
         ClientboundBlockEntityDataPacket.create(this)
 
     companion object {
+        const val REDSTONE_IGNORED = 0
+        const val REDSTONE_LOW = 1
+        const val REDSTONE_HIGH = 2
+
+        /** Idle-poll cadence (ticks) for the auto-break scan. Avoids running
+         *  the registry lookup + filter regex every tick when the front
+         *  block hasn't changed; matches PlacerBlockEntity's PLACE_INTERVAL_TICKS
+         *  rate so a Breaker + Placer pair gated by the same redstone fires
+         *  in lockstep. */
+        const val IDLE_POLL_INTERVAL_TICKS = 20
+
         /** Pick a diamond / wooden tool pair appropriate for [state]. Tries
          *  pickaxe, axe, then shovel and returns the first whose diamond
          *  variant is the correct tool for drops. Null when none of the three
@@ -326,11 +421,23 @@ class BreakerBlockEntity(
             val (_, woodenTool) = pickToolPair(state) ?: return null
             val hardness = state.getDestroySpeed(level, pos)
             if (hardness < 0f) return null
-            // Wooden-tier speed is 0 for blocks it doesn't apply to. Floor at 1.0
-            // so we still produce a finite tick count via the slow-path divisor.
-            val woodSpeed = woodenTool.getDestroySpeed(state).coerceAtLeast(1f)
+            val rawWoodSpeed = woodenTool.getDestroySpeed(state)
+            // Floor at 1.0 so a 0-speed reading (modded edges where the tool's
+            // class doesn't apply at all) still yields a finite tick count.
+            val woodSpeed = rawWoodSpeed.coerceAtLeast(1f)
             val canHarvestWithWood = woodenTool.isCorrectToolForDrops(state)
-            val divisor = if (canHarvestWithWood) 30f else 100f
+            // Three-tier divisor scales the per-tick damage:
+            //   - wooden harvests fully (e.g., cobblestone): fast path (30)
+            //   - wooden's class applies but wrong tier (vanilla iron ore, obsidian): 100
+            //   - wooden doesn't apply at all (modded above-tier blocks where
+            //     even the tool class is wrong): extra-slow (200) so the floor
+            //     above doesn't accidentally make them as fast as tier-applicable
+            //     blocks of the same hardness.
+            val divisor = when {
+                canHarvestWithWood -> 30f
+                rawWoodSpeed > 0f -> 100f
+                else -> 200f
+            }
             val damagePerTick = woodSpeed / (hardness * divisor)
             if (damagePerTick <= 0f) return null
             return ceil(1f / damagePerTick).toInt().coerceAtLeast(1)

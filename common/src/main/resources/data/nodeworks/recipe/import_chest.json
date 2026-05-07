@@ -1,0 +1,19 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "CPC",
+    "DHD",
+    "CNC"
+  ],
+  "key": {
+    "P": "minecraft:sticky_piston",
+    "C": "minecraft:lapis_lazuli",
+    "H": "#c:chests/wooden",
+    "D": "minecraft:deepslate",
+    "N": "nodeworks:node"
+  },
+  "result": {
+    "id": "nodeworks:import_chest",
+    "count": 1
+  }
+}

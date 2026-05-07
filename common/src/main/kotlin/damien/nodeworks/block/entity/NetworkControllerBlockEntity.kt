@@ -134,7 +134,7 @@ class NetworkControllerBlockEntity(
 
     // --- Connectable ---
 
-    override fun getConnections(): Set<BlockPos> = connections.toSet()
+    override fun getConnections(): Set<BlockPos> = connections
 
     override fun addConnection(pos: BlockPos): Boolean {
         if (!connections.add(pos)) return false
@@ -169,15 +169,16 @@ class NetworkControllerBlockEntity(
                 }
             }
         }
-        damien.nodeworks.render.NodeConnectionRenderer.trackConnectable(worldPosition, true)
+        damien.nodeworks.render.NodeConnectionRenderer.trackConnectable(level, worldPosition, true)
     }
 
     override fun setRemoved() {
-        damien.nodeworks.render.NodeConnectionRenderer.trackConnectable(worldPosition, false)
+        damien.nodeworks.render.NodeConnectionRenderer.trackConnectable(level, worldPosition, false)
         val lvl = level
         if (lvl is ServerLevel) {
-            // Unclaim chunk-loading ONLY on actual block destruction, chunk unload runs
-            // setRemoved too and we don't want to tear down our own force-loads there.
+            // Only release on player destruction. Detecting other removal paths
+            // (`/setblock air`, etc.) by reading the new block state here would
+            // race with chunk-unload during world save and hang the save.
             if (blockDestroyed && chunkLoadingEnabled) {
                 releaseAllClaims(lvl)
             }
@@ -229,9 +230,13 @@ class NetworkControllerBlockEntity(
         claimedChunks.clear()
     }
 
-    /** BFS through the full topological connection graph (LOS-blocked pairs included,
-     *  we want every physically-connected block's chunk loaded regardless of temporary
-     *  obstructions) and return the set of packed ChunkPos longs. */
+    /** BFS through the full topological connection graph and return the set
+     *  of packed ChunkPos longs. Walks both [Connectable.getConnections] (the
+     *  legacy laser-link graph) AND face-adjacency neighbours (the pipe-based
+     *  graph) so every device, node, pipe, antenna, etc. that participates
+     *  in the network gets its chunk claimed regardless of which connection
+     *  model it uses. LOS-blocked pairs are included since chunk loading
+     *  shouldn't depend on transient line-of-sight state. */
     private fun gatherTopologyChunks(lvl: ServerLevel): Set<Long> {
         val visited = HashSet<BlockPos>()
         val queue = ArrayDeque<BlockPos>()
@@ -244,6 +249,19 @@ class NetworkControllerBlockEntity(
             val entity = NodeConnectionHelper.getConnectable(lvl, pos) ?: continue
             for (conn in entity.getConnections()) {
                 if (visited.add(conn)) queue.add(conn)
+            }
+            if (entity.usesAdjacency()) {
+                for (dir in net.minecraft.core.Direction.entries) {
+                    val neighbor = pos.relative(dir)
+                    if (!lvl.isLoaded(neighbor)) continue
+                    val neighborBe = lvl.getBlockEntity(neighbor) as? damien.nodeworks.network.Connectable ?: continue
+                    if (!neighborBe.usesAdjacency()) continue
+                    if (!entity.canConnectAdjacentTo(neighborBe)) continue
+                    if (!neighborBe.canConnectAdjacentTo(entity)) continue
+                    if (entity.forcedPipeBlocked(dir)) continue
+                    if (neighborBe.forcedPipeBlocked(dir.opposite)) continue
+                    if (visited.add(neighbor)) queue.add(neighbor)
+                }
             }
         }
         return chunks

@@ -162,6 +162,18 @@ class ScriptEngine(
      *  a tick throws so the player sees the error without the preset unscheduling. */
     internal fun logError(msg: String) = logCallback(msg, true)
 
+    /** Whether a card with the given physical identity still exists in the
+     *  current network. Same identity rule as [CardHandle.verifyCardOnNetwork]
+     *  so card-removal handling is consistent across the synchronous Lua API
+     *  and the async redstone/observer poll loops. */
+    private fun cardStillOnNetwork(adjacentPos: BlockPos, type: String, slotIndex: Int): Boolean {
+        return currentNetworkSnapshot().allCards().any { c ->
+            c.capability.adjacentPos == adjacentPos &&
+                c.capability.type == type &&
+                c.slotIndex == slotIndex
+        }
+    }
+
     /** Precomputed route table set by network:route(). */
     var routeTable: RouteTable? = null
         private set
@@ -180,9 +192,12 @@ class ScriptEngine(
     /** Processing handlers registered by network:handle(). Keyed by card name. */
     val processingHandlers = mutableMapOf<String, LuaFunction>()
 
-    /** Redstone onChange callbacks. Keyed by card alias → (capability, lastStrength, callback). */
+    /** Redstone onChange callbacks. Keyed by card alias → (capability, lastStrength, callback).
+     *  [slotIndex] pins the registration to a specific physical card slot so removing the
+     *  card evicts the callback even if a similar card is later placed at the same Node face. */
     private data class RedstoneCallback(
         val capability: damien.nodeworks.card.RedstoneSideCapability,
+        val slotIndex: Int,
         var lastStrength: Int,
         val callback: LuaFunction
     )
@@ -191,9 +206,11 @@ class ScriptEngine(
     /** Observer onChange callbacks. Keyed by card alias → (capability, lastState, callback).
      *  [lastState] starts populated with the state observed when the script registers the
      *  callback so a fresh script run doesn't fire a spurious onChange for a block that's
-     *  been sitting in its final form since before the script started. */
+     *  been sitting in its final form since before the script started. [slotIndex] pins the
+     *  registration to a specific physical card slot, see [RedstoneCallback] for the rationale. */
     private data class ObserverCallback(
         val capability: damien.nodeworks.card.ObserverSideCapability,
+        val slotIndex: Int,
         var lastState: net.minecraft.world.level.block.state.BlockState,
         val callback: LuaFunction
     )
@@ -499,6 +516,11 @@ class ScriptEngine(
             // previous value so the change is re-detected next tick. No events
             // get silently swallowed.
             if (System.nanoTime() >= tickDeadlineNs) break
+            if (!cardStillOnNetwork(cb.capability.adjacentPos, cb.capability.type, cb.slotIndex)) {
+                logCallback("Redstone handler on '$alias' removed: card is no longer on the network.", false)
+                toEvict += alias
+                continue
+            }
             val currentStrength = level.getSignal(cb.capability.adjacentPos, cb.capability.nodeSide)
             if (currentStrength == cb.lastStrength) continue
             cb.lastStrength = currentStrength
@@ -530,6 +552,11 @@ class ScriptEngine(
         val toEvict = mutableListOf<String>()
         for ((alias, cb) in observerCallbacks.toList()) {
             if (System.nanoTime() >= tickDeadlineNs) break
+            if (!cardStillOnNetwork(cb.capability.adjacentPos, cb.capability.type, cb.slotIndex)) {
+                logCallback("Observer handler on '$alias' removed: card is no longer on the network.", false)
+                toEvict += alias
+                continue
+            }
             val pos = cb.capability.adjacentPos
             if (!level.isLoaded(pos)) continue
             val current = level.getBlockState(pos)
@@ -678,26 +705,45 @@ class ScriptEngine(
         }
     }
 
-    /** Build a Lua table for a placer device with `:place(...)` rate-limited via
-     *  [placementLimiter]. Centralised here because [PlacerHandle.create] has
-     *  five call sites and we want consistent rate-limiting across all of them. */
+    /** Wrap a method on [table] with the network's placement budget. No-op
+     *  when [methodName] isn't a function (e.g. nil'd at handle creation). */
+    private fun wrapWithPlacementLimit(table: LuaTable, opLabel: String, methodName: String) {
+        val orig = table.get(methodName)
+        if (!orig.isfunction()) return
+        table.set(methodName, networkRateLimited(
+            opLabel,
+            consume = { b, tick -> b.tryConsumePlacement(tick) },
+            warnOp = NetworkBudget.WARN_PLACEMENT,
+            orig,
+            onLimit = LuaValue.FALSE,
+        ))
+    }
+
     private fun createPlacerTable(
         snapshot: damien.nodeworks.network.PlacerSnapshot,
-        networkSnapshot: damien.nodeworks.network.NetworkSnapshot,
     ): LuaTable {
-        val table = PlacerHandle.create(snapshot, networkSnapshot, level)
-        val origPlace = table.get("place")
-        if (origPlace.isfunction()) {
-            table.set("place", networkRateLimited(
-                "placer:place",
-                consume = { b, tick -> b.tryConsumePlacement(tick) },
-                warnOp = NetworkBudget.WARN_PLACEMENT,
-                origPlace,
-                onLimit = LuaValue.FALSE,
-            ))
-        }
+        val table = PlacerHandle.create(snapshot, ::currentNetworkSnapshot, level)
+        wrapWithPlacementLimit(table, "placer:place", "place")
         return table
     }
+
+    /** [UserHandle.use] drives a FakePlayer interaction so it shares the
+     *  placement budget. [UserHandle.stop] is a release / cleanup, gating
+     *  it on the budget would leave the User stuck holding right-click when
+     *  the bucket is empty, so it's intentionally unbounded. */
+    private fun createUserTable(
+        snapshot: damien.nodeworks.network.UserSnapshot,
+    ): LuaTable {
+        val table = damien.nodeworks.script.UserHandle.create(snapshot, level)
+        wrapWithPlacementLimit(table, "user:use", "use")
+        return table
+    }
+
+    /** Live network snapshot for handle closures that outlive the call that
+     *  created them. Goes through [NetworkDiscovery]'s per-tick cache so
+     *  repeated calls within one tick collapse to one BFS. */
+    private fun currentNetworkSnapshot(): NetworkSnapshot =
+        NetworkDiscovery.discoverNetwork(level, networkEntryNode)
 
     /** Build a Lua table for a variable card with `:set` and `:cas` rate-limited via
      *  [variableWriteLimiter]. Each write fires `setChanged` + `sendBlockUpdated`,
@@ -729,12 +775,25 @@ class ScriptEngine(
     }
 
     private fun createCardTable(card: damien.nodeworks.network.CardSnapshot, alias: String): LuaTable {
-        val table = CardHandle.create(card, level, currentSnapshot()?.controller?.networkId)
+        val table = CardHandle.create(
+            card,
+            level,
+            currentSnapshot()?.controller?.networkId,
+            ::currentNetworkSnapshot,
+        )
         // Per-tick call cap is enforced inside [CardHandle.buildInsertFn] so all
         // insert paths share the budget uniformly, including handles returned from
         // `:face(...)` / `:slots(...)` (which build a fresh table that wouldn't
         // pass through a post-hoc wrapper here).
         val cap = card.capability
+        // Throw on calls that arrive after the card was removed/moved. The
+        // CardHandle's own verifier only fires for storage-resolving methods,
+        // redstone and observer methods bypass that path and need their own gate.
+        fun verifyCardPresent() {
+            if (!cardStillOnNetwork(cap.adjacentPos, cap.type, card.slotIndex)) {
+                throw LuaError("Card '${card.effectiveAlias}' is no longer on the network")
+            }
+        }
 
         if (cap is damien.nodeworks.card.RedstoneSideCapability) {
             // Remove inventory methods that don't apply to redstone. `face` is also cleared
@@ -755,6 +814,7 @@ class ScriptEngine(
             // powered() → boolean
             table.setGuarded("RedstoneCard", "powered", object : OneArgFunction() {
                 override fun call(selfArg: LuaValue): LuaValue {
+                    verifyCardPresent()
                     val strength = level.getSignal(cap.adjacentPos, cap.nodeSide)
                     return LuaValue.valueOf(strength > 0)
                 }
@@ -763,6 +823,7 @@ class ScriptEngine(
             // strength() → number 0-15
             table.setGuarded("RedstoneCard", "strength", object : OneArgFunction() {
                 override fun call(selfArg: LuaValue): LuaValue {
+                    verifyCardPresent()
                     val strength = level.getSignal(cap.adjacentPos, cap.nodeSide)
                     return LuaValue.valueOf(strength)
                 }
@@ -775,6 +836,7 @@ class ScriptEngine(
                 warnOp = NetworkBudget.WARN_REDSTONE_WRITE,
                 object : TwoArgFunction() {
                     override fun call(selfArg: LuaValue, valueArg: LuaValue): LuaValue {
+                        verifyCardPresent()
                         val strength = when {
                             valueArg.isboolean() -> if (valueArg.toboolean()) 15 else 0
                             valueArg.isnumber() -> valueArg.checkint().coerceIn(0, 15)
@@ -798,7 +860,7 @@ class ScriptEngine(
                     // place is doing the right thing and shouldn't trip a cap.
                     if (alias !in redstoneCallbacks) assertCallbackCap(redstoneCallbacks.size, "redstone-handler")
                     val currentStrength = level.getSignal(cap.adjacentPos, cap.nodeSide)
-                    redstoneCallbacks[alias] = RedstoneCallback(cap, currentStrength, fn)
+                    redstoneCallbacks[alias] = RedstoneCallback(cap, card.slotIndex, currentStrength, fn)
                     return LuaValue.NIL
                 }
             })
@@ -819,14 +881,18 @@ class ScriptEngine(
 
             // block() → string, current block id at the watched position.
             table.setGuarded("ObserverCard", "block", object : OneArgFunction() {
-                override fun call(selfArg: LuaValue): LuaValue =
-                    LuaValue.valueOf(blockIdOf(level.getBlockState(cap.adjacentPos)))
+                override fun call(selfArg: LuaValue): LuaValue {
+                    verifyCardPresent()
+                    return LuaValue.valueOf(blockIdOf(level.getBlockState(cap.adjacentPos)))
+                }
             })
 
             // state() → { [string]: any }, properties of the watched block.
             table.setGuarded("ObserverCard", "state", object : OneArgFunction() {
-                override fun call(selfArg: LuaValue): LuaValue =
-                    blockStateToLua(level.getBlockState(cap.adjacentPos))
+                override fun call(selfArg: LuaValue): LuaValue {
+                    verifyCardPresent()
+                    return blockStateToLua(level.getBlockState(cap.adjacentPos))
+                }
             })
 
             // onChange(function(block: string, state: table))
@@ -838,7 +904,7 @@ class ScriptEngine(
                     val fn = fnArg.checkfunction()
                     if (alias !in observerCallbacks) assertCallbackCap(observerCallbacks.size, "observer-handler")
                     val seed = level.getBlockState(cap.adjacentPos)
-                    observerCallbacks[alias] = ObserverCallback(cap, seed, fn)
+                    observerCallbacks[alias] = ObserverCallback(cap, card.slotIndex, seed, fn)
                     return LuaValue.NIL
                 }
             })
@@ -862,11 +928,18 @@ class ScriptEngine(
      * surface is lost by going through a channel.
      */
     private fun createChannelTable(
-        snapshot: NetworkSnapshot,
         color: net.minecraft.world.item.DyeColor,
     ): LuaTable {
+        fun snapshot(): NetworkSnapshot = currentNetworkSnapshot()
         val t = LuaTable()
         val selfRef = this
+
+        // Marker fields so [CardRefs.fromLua] can recognise this table as a channel
+        // pool reference when passed to `importer:from(channel)` / `:to(channel)` /
+        // `stocker:from(channel)` / `:to(channel)`. The color id round-trips back to
+        // a DyeColor on the Kotlin side.
+        t.set("_isChannelRef", LuaValue.TRUE)
+        t.set("_channelColorId", LuaValue.valueOf(color.id))
 
         // :getFirst(type), first card or variable matching [type] AND this channel,
         // or nil. Renamed from `:first` to keep every "fetch" method in the API on
@@ -875,18 +948,22 @@ class ScriptEngine(
             override fun call(selfArg: LuaValue, typeArg: LuaValue): LuaValue {
                 val type = typeArg.checkjstring()
                 if (type == "variable") {
-                    val v = snapshot.variables.firstOrNull { it.channel == color } ?: return LuaValue.NIL
+                    val v = snapshot().variables.firstOrNull { it.channel == color } ?: return LuaValue.NIL
                     return createVariableTable(v)
                 }
                 if (type == "breaker") {
-                    val b = snapshot.breakers.firstOrNull { it.channel == color } ?: return LuaValue.NIL
-                    return BreakerHandle.create(b, snapshot, level)
+                    val b = snapshot().breakers.firstOrNull { it.channel == color } ?: return LuaValue.NIL
+                    return BreakerHandle.create(b, level)
                 }
                 if (type == "placer") {
-                    val p = snapshot.placers.firstOrNull { it.channel == color } ?: return LuaValue.NIL
-                    return createPlacerTable(p, snapshot)
+                    val p = snapshot().placers.firstOrNull { it.channel == color } ?: return LuaValue.NIL
+                    return createPlacerTable(p)
                 }
-                val card = snapshot.allCards().firstOrNull {
+                if (type == "user") {
+                    val u = snapshot().users.firstOrNull { it.channel == color } ?: return LuaValue.NIL
+                    return createUserTable(u)
+                }
+                val card = snapshot().allCards().firstOrNull {
                     it.channel == color && it.capability.type == type
                 } ?: return LuaValue.NIL
                 return selfRef.createCardTable(card, card.effectiveAlias)
@@ -902,30 +979,36 @@ class ScriptEngine(
                 val type: String? = if (args.narg() >= 2 && !args.arg(2).isnil()) args.checkjstring(2) else null
                 val members = mutableListOf<LuaValue>()
                 // Variables, breakers, placers, and cards are independent collections
-                // on the snapshot, iterate each only when [type] selects it (or is
+                // on the snapshot(), iterate each only when [type] selects it (or is
                 // null = "all members"). Order in the resulting list is variables →
                 // breakers → placers → cards so a full :getAll() walks devices first
                 // then cards, which roughly matches sidebar ordering.
                 if (type == null || type == "variable") {
-                    for (v in snapshot.variables) {
+                    for (v in snapshot().variables) {
                         if (v.channel != color) continue
                         members.add(createVariableTable(v))
                     }
                 }
                 if (type == null || type == "breaker") {
-                    for (b in snapshot.breakers) {
+                    for (b in snapshot().breakers) {
                         if (b.channel != color) continue
-                        members.add(BreakerHandle.create(b, snapshot, level))
+                        members.add(BreakerHandle.create(b, level))
                     }
                 }
                 if (type == null || type == "placer") {
-                    for (p in snapshot.placers) {
+                    for (p in snapshot().placers) {
                         if (p.channel != color) continue
-                        members.add(createPlacerTable(p, snapshot))
+                        members.add(createPlacerTable(p))
                     }
                 }
-                if (type != "variable" && type != "breaker" && type != "placer") {
-                    for (card in snapshot.allCards()) {
+                if (type == null || type == "user") {
+                    for (u in snapshot().users) {
+                        if (u.channel != color) continue
+                        members.add(createUserTable(u))
+                    }
+                }
+                if (type != "variable" && type != "breaker" && type != "placer" && type != "user") {
+                    for (card in snapshot().allCards()) {
                         if (card.channel != color) continue
                         if (type != null && card.capability.type != type) continue
                         members.add(selfRef.createCardTable(card, card.effectiveAlias))
@@ -943,19 +1026,147 @@ class ScriptEngine(
         t.set("get", object : TwoArgFunction() {
             override fun call(selfArg: LuaValue, aliasArg: LuaValue): LuaValue {
                 val alias = aliasArg.checkjstring()
-                val card = snapshot.allCards().firstOrNull {
+                val card = snapshot().allCards().firstOrNull {
                     it.channel == color && it.effectiveAlias == alias
                 }
                 if (card != null) return selfRef.createCardTable(card, card.effectiveAlias)
-                val v = snapshot.variables.firstOrNull { it.channel == color && it.name == alias }
+                val v = snapshot().variables.firstOrNull { it.channel == color && it.name == alias }
                 if (v != null) return createVariableTable(v)
-                val b = snapshot.breakers.firstOrNull { it.channel == color && it.effectiveAlias == alias }
-                if (b != null) return BreakerHandle.create(b, snapshot, level)
-                val p = snapshot.placers.firstOrNull { it.channel == color && it.effectiveAlias == alias }
-                if (p != null) return createPlacerTable(p, snapshot)
+                val b = snapshot().breakers.firstOrNull { it.channel == color && it.effectiveAlias == alias }
+                if (b != null) return BreakerHandle.create(b, level)
+                val p = snapshot().placers.firstOrNull { it.channel == color && it.effectiveAlias == alias }
+                if (p != null) return createPlacerTable(p)
+                val u = snapshot().users.firstOrNull { it.channel == color && it.effectiveAlias == alias }
+                if (u != null) return createUserTable(u)
                 throw LuaError("No member named '$alias' on the ${color.name.lowercase()} channel")
             }
         })
+
+        // :count(filter), :find(filter), :findEach(filter), :insert(handle, count?),
+        // :tryInsert(handle, count?). Mirror the Network:* methods but scoped to this
+        // channel's storage cards. All five route through the same helpers Network
+        // uses, just with a non-default [ChannelFilter.Color] argument so non-matching
+        // cards are skipped during scan/insert.
+        val channelFilter = damien.nodeworks.network.ChannelFilter.Color(color)
+
+        t.set("count", object : TwoArgFunction() {
+            override fun call(selfArg: LuaValue, filterArg: LuaValue): LuaValue {
+                val filter = filterArg.checkjstring()
+                val total = NetworkStorageHelper.countResource(level, snapshot(), filter, channelFilter)
+                return LuaValue.valueOf(total.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+            }
+        })
+
+        t.set("find", object : TwoArgFunction() {
+            override fun call(selfArg: LuaValue, filterArg: LuaValue): LuaValue {
+                val filter = filterArg.checkjstring()
+                val (kindGate, _) = CardHandle.parseFilterKind(filter)
+                if (kindGate == null || kindGate == damien.nodeworks.platform.ResourceKind.ITEM) {
+                    val itemResult = NetworkStorageHelper.findFirstItemInfoAcrossNetwork(level, snapshot(), filter, channelFilter)
+                    if (itemResult != null) {
+                        val (info, _) = itemResult
+                        val totalCount = NetworkStorageHelper.countItems(level, snapshot(), filter, channelFilter)
+                        val aggregated = info.copy(count = totalCount)
+                        val sourceStorage: () -> damien.nodeworks.platform.ItemStorageHandle? = {
+                            NetworkStorageHelper.getStorageCards(snapshot())
+                                .filter { channelFilter.matches(it.channel) }
+                                .firstNotNullOfOrNull { card ->
+                                    val storage = NetworkStorageHelper.getStorage(level, card)
+                                    if (storage != null) {
+                                        val has = damien.nodeworks.platform.PlatformServices.storage.countItems(storage) {
+                                            CardHandle.matchesFilter(it, damien.nodeworks.platform.ResourceKind.ITEM, filter)
+                                        }
+                                        if (has > 0) storage else null
+                                    } else null
+                                }
+                        }
+                        return ItemsHandle.toLuaTable(ItemsHandle.fromItemInfo(aggregated, filter, sourceStorage, level))
+                    }
+                }
+                if (kindGate == null || kindGate == damien.nodeworks.platform.ResourceKind.FLUID) {
+                    val fluidResult = NetworkStorageHelper.findFirstFluidInfoAcrossNetwork(level, snapshot(), filter, channelFilter)
+                    if (fluidResult != null) {
+                        val (info, _) = fluidResult
+                        val totalAmount = NetworkStorageHelper.countFluid(level, snapshot(), filter, channelFilter)
+                        val aggregated = damien.nodeworks.platform.FluidInfo(info.fluidId, info.name, totalAmount)
+                        val fluidSource: () -> damien.nodeworks.platform.FluidStorageHandle? = {
+                            NetworkStorageHelper.getStorageCards(snapshot())
+                                .filter { channelFilter.matches(it.channel) }
+                                .firstNotNullOfOrNull { card ->
+                                    val storage = NetworkStorageHelper.getFluidStorage(level, card)
+                                    if (storage != null) {
+                                        val has = damien.nodeworks.platform.PlatformServices.storage.countFluid(storage) { it == info.fluidId }
+                                        if (has > 0) storage else null
+                                    } else null
+                                }
+                        }
+                        return ItemsHandle.toLuaTable(ItemsHandle.fromFluidInfo(aggregated, filter, fluidSource, level))
+                    }
+                }
+                return LuaValue.NIL
+            }
+        })
+
+        t.set("findEach", object : TwoArgFunction() {
+            override fun call(selfArg: LuaValue, filterArg: LuaValue): LuaValue {
+                val filter = filterArg.checkjstring()
+                val (kindGate, _) = CardHandle.parseFilterKind(filter)
+                val result = LuaTable()
+                var idx = 1
+                if (kindGate == null || kindGate == damien.nodeworks.platform.ResourceKind.ITEM) {
+                    val allItems = NetworkStorageHelper.findAllItemInfoAcrossNetwork(level, snapshot(), filter, channelFilter)
+                    if (allItems.size > MAX_FINDEACH_RESULTS) {
+                        throw LuaError(
+                            "Channel('${color.name.lowercase()}'):findEach('$filter') matched ${allItems.size} distinct items, " +
+                            "above the $MAX_FINDEACH_RESULTS cap. Narrow the filter or use :count(filter) for an aggregate."
+                        )
+                    }
+                    for ((info, _) in allItems) {
+                        val sourceStorage: () -> damien.nodeworks.platform.ItemStorageHandle? = {
+                            NetworkStorageHelper.getStorageCards(snapshot())
+                                .filter { channelFilter.matches(it.channel) }
+                                .firstNotNullOfOrNull { card ->
+                                    val storage = NetworkStorageHelper.getStorage(level, card)
+                                    if (storage != null) {
+                                        val has = damien.nodeworks.platform.PlatformServices.storage.countItems(storage) { it == info.itemId }
+                                        if (has > 0) storage else null
+                                    } else null
+                                }
+                        }
+                        val handle = ItemsHandle.fromItemInfo(info, info.itemId, sourceStorage, level)
+                        result.set(idx++, ItemsHandle.toLuaTable(handle))
+                    }
+                }
+                if (kindGate == null || kindGate == damien.nodeworks.platform.ResourceKind.FLUID) {
+                    val allFluids = NetworkStorageHelper.findAllFluidInfoAcrossNetwork(level, snapshot(), filter, channelFilter)
+                    if (idx - 1 + allFluids.size > MAX_FINDEACH_RESULTS) {
+                        throw LuaError(
+                            "Channel('${color.name.lowercase()}'):findEach('$filter') matched ${idx - 1 + allFluids.size} distinct resources, " +
+                            "above the $MAX_FINDEACH_RESULTS cap. Narrow the filter or use :count(filter)."
+                        )
+                    }
+                    for ((info, _) in allFluids) {
+                        val fluidSource: () -> damien.nodeworks.platform.FluidStorageHandle? = {
+                            NetworkStorageHelper.getStorageCards(snapshot())
+                                .filter { channelFilter.matches(it.channel) }
+                                .firstNotNullOfOrNull { card ->
+                                    val storage = NetworkStorageHelper.getFluidStorage(level, card)
+                                    if (storage != null) {
+                                        val has = damien.nodeworks.platform.PlatformServices.storage.countFluid(storage) { it == info.fluidId }
+                                        if (has > 0) storage else null
+                                    } else null
+                                }
+                        }
+                        val handle = ItemsHandle.fromFluidInfo(info, "\$fluid:${info.fluidId}", fluidSource, level)
+                        result.set(idx++, ItemsHandle.toLuaTable(handle))
+                    }
+                }
+                return result
+            }
+        })
+
+        t.set("insert", buildNetworkInsertFn(atomic = true, channel = channelFilter))
+        t.set("tryInsert", buildNetworkInsertFn(atomic = false, channel = channelFilter))
 
         return t
     }
@@ -1071,7 +1282,10 @@ class ScriptEngine(
      * network as a whole. `routeTable` / `inventoryCache` are read from `this` at call
      * time so routes registered mid-script via `network:route` take effect.
      */
-    private fun buildNetworkInsertFn(snapshot: NetworkSnapshot, atomic: Boolean): VarArgFunction {
+    private fun buildNetworkInsertFn(
+        atomic: Boolean,
+        channel: damien.nodeworks.network.ChannelFilter = damien.nodeworks.network.ChannelFilter.All,
+    ): VarArgFunction {
         return object : VarArgFunction() {
             override fun invoke(args: Varargs): Varargs {
                 val itemsTable = args.checktable(2)
@@ -1090,10 +1304,11 @@ class ScriptEngine(
                     return if (atomic) LuaValue.FALSE else LuaValue.valueOf(0)
                 }
 
+                val snapshot = currentNetworkSnapshot()
                 return if (itemsHandle.kind == damien.nodeworks.platform.ResourceKind.FLUID) {
-                    invokeFluid(snapshot, itemsHandle, requested, atomic)
+                    invokeFluid(snapshot, itemsHandle, requested, atomic, channel)
                 } else {
-                    invokeItems(snapshot, itemsHandle, requested, atomic)
+                    invokeItems(snapshot, itemsHandle, requested, atomic, channel)
                 }
             }
         }
@@ -1114,7 +1329,8 @@ class ScriptEngine(
         snapshot: NetworkSnapshot,
         itemsHandle: ItemsHandle,
         requested: Long,
-        atomic: Boolean
+        atomic: Boolean,
+        channel: damien.nodeworks.network.ChannelFilter = damien.nodeworks.network.ChannelFilter.All,
     ): LuaValue {
         val sourceFluid = itemsHandle.fluidSourceStorage()
             ?: return if (atomic) LuaValue.FALSE else LuaValue.valueOf(0)
@@ -1125,6 +1341,7 @@ class ScriptEngine(
             var capacity = 0L
             for (card in storageCards) {
                 if (capacity >= requested) break
+                if (!channel.matches(card.channel)) continue
                 val dest = NetworkStorageHelper.getFluidStorage(level, card) ?: continue
                 capacity += try {
                     damien.nodeworks.platform.PlatformServices.storage.simulateInsertFluid(
@@ -1147,7 +1364,7 @@ class ScriptEngine(
                 return LuaValue.FALSE
             }
             val placed = NetworkStorageHelper.insertFluidAcrossNetwork(
-                level, snapshot, itemsHandle.itemId, drained, inventoryCache
+                level, snapshot, itemsHandle.itemId, drained, inventoryCache, channel
             )
             if (placed < drained) {
                 // Commit diverged from sim, refund the shortfall to source.
@@ -1165,7 +1382,7 @@ class ScriptEngine(
         )
         if (drained <= 0L) return LuaValue.valueOf(0)
         val placed = NetworkStorageHelper.insertFluidAcrossNetwork(
-            level, snapshot, itemsHandle.itemId, drained, inventoryCache
+            level, snapshot, itemsHandle.itemId, drained, inventoryCache, channel
         )
         if (placed < drained) {
             damien.nodeworks.platform.PlatformServices.storage.insertFluid(
@@ -1184,14 +1401,15 @@ class ScriptEngine(
         snapshot: NetworkSnapshot,
         itemsHandle: ItemsHandle,
         requested: Long,
-        atomic: Boolean
+        atomic: Boolean,
+        channel: damien.nodeworks.network.ChannelFilter = damien.nodeworks.network.ChannelFilter.All,
     ): LuaValue {
         // Buffer-backed handle (e.g. the one passed to a `:craft():connect(...)` callback):
         // drain from the CPU buffer into network storage stack-by-stack instead of going
         // through `sourceStorage()`, which is null for buffer-only handles.
         val bufSrc = itemsHandle.bufferSource
         if (bufSrc != null) {
-            return invokeItemsFromBuffer(snapshot, bufSrc, requested, atomic)
+            return invokeItemsFromBuffer(snapshot, bufSrc, requested, atomic, channel)
         }
         val sourceStorage = itemsHandle.sourceStorage()
             ?: return if (atomic) LuaValue.FALSE else LuaValue.valueOf(0)
@@ -1217,14 +1435,14 @@ class ScriptEngine(
         return if (atomic) {
             val ok = NetworkStorageHelper.tryInsertItemsAcrossNetwork(
                 level, snapshot, sourceStorage, itemsHandle.filter,
-                clamped, routeTable, inventoryCache
+                clamped, routeTable, inventoryCache, channel
             )
             if (ok) budget.noteItemsMoved(tick, clamped)
             LuaValue.valueOf(ok)
         } else {
             val moved = NetworkStorageHelper.insertItems(
                 level, snapshot, sourceStorage, itemsHandle.filter,
-                clamped, routeTable, null, inventoryCache
+                clamped, routeTable, null, inventoryCache, channel
             )
             budget.noteItemsMoved(tick, moved)
             LuaValue.valueOf(moved.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
@@ -1240,7 +1458,8 @@ class ScriptEngine(
         snapshot: NetworkSnapshot,
         bufSrc: damien.nodeworks.script.BufferSource,
         requested: Long,
-        atomic: Boolean
+        atomic: Boolean,
+        channel: damien.nodeworks.network.ChannelFilter = damien.nodeworks.network.ChannelFilter.All,
     ): LuaValue {
         val id = net.minecraft.resources.Identifier.tryParse(bufSrc.itemId)
             ?: return if (atomic) LuaValue.FALSE else LuaValue.valueOf(0)
@@ -1274,7 +1493,7 @@ class ScriptEngine(
             while (remaining > 0L) {
                 val batch = minOf(remaining, maxStack).toInt()
                 val stack = net.minecraft.world.item.ItemStack(item, batch)
-                val inserted = NetworkStorageHelper.insertItemStack(level, snapshot, stack, inventoryCache).toLong()
+                val inserted = NetworkStorageHelper.insertItemStack(level, snapshot, stack, inventoryCache, channel).toLong()
                 totalInserted += inserted
                 remaining -= inserted
                 if (inserted == 0L) break
@@ -1307,7 +1526,11 @@ class ScriptEngine(
     }
 
     private fun injectApi(g: Globals) {
-        val snapshot = networkSnapshot!!
+        // Per-call snapshot accessor. Each call re-discovers so handle closures
+        // that outlive their creating call (`local h = network:find('x'); ... ; h:extract(1)`)
+        // see card additions/removals the player made in between. The per-tick
+        // cache in [NetworkDiscovery] collapses repeat calls within one tick.
+        fun snapshot(): NetworkSnapshot = currentNetworkSnapshot()
 
         // scheduler object
         g.set("scheduler", scheduler.createLuaTable())
@@ -1328,10 +1551,12 @@ class ScriptEngine(
         networkTable.setGuarded("Network", "get", object : TwoArgFunction() {
             override fun call(selfArg: LuaValue, aliasArg: LuaValue): LuaValue {
                 val alias = aliasArg.checkjstring()
-                snapshot.findByAlias(alias)?.let { return createCardTable(it, alias) }
-                snapshot.findVariable(alias)?.let { return createVariableTable(it) }
-                snapshot.findBreaker(alias)?.let { return BreakerHandle.create(it, snapshot, level) }
-                snapshot.findPlacer(alias)?.let { return createPlacerTable(it, snapshot) }
+                val s = snapshot()
+                s.findByAlias(alias)?.let { return createCardTable(it, alias) }
+                s.findVariable(alias)?.let { return createVariableTable(it) }
+                s.findBreaker(alias)?.let { return BreakerHandle.create(it, level) }
+                s.findPlacer(alias)?.let { return createPlacerTable(it) }
+                s.findUser(alias)?.let { return createUserTable(it) }
                 throw LuaError("Not found on network: '$alias'")
             }
         })
@@ -1346,15 +1571,15 @@ class ScriptEngine(
             override fun call(selfArg: LuaValue, typeArg: LuaValue): LuaValue {
                 val type = typeArg.checkjstring()
                 if (type == "variable") {
-                    val members = snapshot.variables.map { createVariableTable(it) as LuaValue }
+                    val members = snapshot().variables.map { createVariableTable(it) as LuaValue }
                     return createHandleListTable(
                         members,
                         HandleListMethods.methodsForHandleType("VariableHandle"),
                     )
                 }
                 if (type == "breaker") {
-                    val members = snapshot.breakers.map {
-                        BreakerHandle.create(it, snapshot, level) as LuaValue
+                    val members = snapshot().breakers.map {
+                        BreakerHandle.create(it, level) as LuaValue
                     }
                     return createHandleListTable(
                         members,
@@ -1362,15 +1587,24 @@ class ScriptEngine(
                     )
                 }
                 if (type == "placer") {
-                    val members = snapshot.placers.map {
-                        createPlacerTable(it, snapshot) as LuaValue
+                    val members = snapshot().placers.map {
+                        createPlacerTable(it) as LuaValue
                     }
                     return createHandleListTable(
                         members,
                         HandleListMethods.methodsForCapabilityType("placer"),
                     )
                 }
-                val cards = snapshot.allCards().filter { it.capability.type == type }
+                if (type == "user") {
+                    val members = snapshot().users.map {
+                        createUserTable(it) as LuaValue
+                    }
+                    return createHandleListTable(
+                        members,
+                        HandleListMethods.methodsForCapabilityType("user"),
+                    )
+                }
+                val cards = snapshot().allCards().filter { it.capability.type == type }
                 val members = cards.map { createCardTable(it, it.effectiveAlias) as LuaValue }
                 return createHandleListTable(
                     members,
@@ -1386,7 +1620,7 @@ class ScriptEngine(
         // `network:cards("io_*"):face("bottom")` returns a HandleList where every
         // member is a face-overridden CardHandle, ready to feed into the importer.
         //
-        // The HandleList is a snapshot taken at call time. New cards added later
+        // The HandleList is a snapshot() taken at call time. New cards added later
         // won't show up in it, re-call `network:cards` to refresh. For tick-time
         // re-resolution, use the bare-string wildcard form on importer/stocker
         // (`importer:from("io_*")`).
@@ -1394,7 +1628,7 @@ class ScriptEngine(
             override fun call(selfArg: LuaValue, patternArg: LuaValue): LuaValue {
                 val pattern = patternArg.checkjstring()
                 val regex = damien.nodeworks.script.preset.wildcardToRegex(pattern)
-                val matched = snapshot.allCards()
+                val matched = snapshot().allCards()
                     .filter { regex.matchEntire(it.effectiveAlias) != null }
                     .distinctBy { it.effectiveAlias }
                 val members = matched.map { createCardTable(it, it.effectiveAlias) as LuaValue }
@@ -1420,7 +1654,7 @@ class ScriptEngine(
                 val name = colorArg.checkjstring()
                 val color = net.minecraft.world.item.DyeColor.byName(name, null)
                     ?: throw LuaError("Unknown channel color: '$name'. Use one of the 16 dye color names (white, red, blue, ...).")
-                return createChannelTable(snapshot, color)
+                return createChannelTable(color)
             }
         })
 
@@ -1432,10 +1666,11 @@ class ScriptEngine(
         networkTable.setGuarded("Network", "channels", object : OneArgFunction() {
             override fun call(selfArg: LuaValue): LuaValue {
                 val seen = sortedSetOf<net.minecraft.world.item.DyeColor>(compareBy { it.id })
-                snapshot.allCards().forEach { seen.add(it.channel) }
-                snapshot.variables.forEach { seen.add(it.channel) }
-                snapshot.breakers.forEach { seen.add(it.channel) }
-                snapshot.placers.forEach { seen.add(it.channel) }
+                snapshot().allCards().forEach { seen.add(it.channel) }
+                snapshot().variables.forEach { seen.add(it.channel) }
+                snapshot().breakers.forEach { seen.add(it.channel) }
+                snapshot().placers.forEach { seen.add(it.channel) }
+                snapshot().users.forEach { seen.add(it.channel) }
                 val result = LuaTable()
                 for ((i, color) in seen.withIndex()) {
                     result.set(i + 1, LuaValue.valueOf(color.name.lowercase()))
@@ -1452,13 +1687,13 @@ class ScriptEngine(
                 val (kindGate, _) = CardHandle.parseFilterKind(filter)
 
                 if (kindGate == null || kindGate == damien.nodeworks.platform.ResourceKind.ITEM) {
-                    val itemResult = NetworkStorageHelper.findFirstItemInfoAcrossNetwork(level, snapshot, filter)
+                    val itemResult = NetworkStorageHelper.findFirstItemInfoAcrossNetwork(level, snapshot(), filter)
                     if (itemResult != null) {
                         val (info, _) = itemResult
-                        val totalCount = NetworkStorageHelper.countItems(level, snapshot, filter)
+                        val totalCount = NetworkStorageHelper.countItems(level, snapshot(), filter)
                         val aggregatedInfo = info.copy(count = totalCount)
                         val sourceStorage: () -> damien.nodeworks.platform.ItemStorageHandle? = {
-                            NetworkStorageHelper.getStorageCards(snapshot).firstNotNullOfOrNull { card ->
+                            NetworkStorageHelper.getStorageCards(snapshot()).firstNotNullOfOrNull { card ->
                                 val storage = NetworkStorageHelper.getStorage(level, card)
                                 if (storage != null) {
                                     val has = damien.nodeworks.platform.PlatformServices.storage.countItems(storage) {
@@ -1472,13 +1707,13 @@ class ScriptEngine(
                     }
                 }
                 if (kindGate == null || kindGate == damien.nodeworks.platform.ResourceKind.FLUID) {
-                    val fluidResult = NetworkStorageHelper.findFirstFluidInfoAcrossNetwork(level, snapshot, filter)
+                    val fluidResult = NetworkStorageHelper.findFirstFluidInfoAcrossNetwork(level, snapshot(), filter)
                     if (fluidResult != null) {
                         val (info, _) = fluidResult
-                        val totalAmount = NetworkStorageHelper.countFluid(level, snapshot, filter)
+                        val totalAmount = NetworkStorageHelper.countFluid(level, snapshot(), filter)
                         val aggregated = damien.nodeworks.platform.FluidInfo(info.fluidId, info.name, totalAmount)
                         val fluidSource: () -> damien.nodeworks.platform.FluidStorageHandle? = {
-                            NetworkStorageHelper.getStorageCards(snapshot).firstNotNullOfOrNull { card ->
+                            NetworkStorageHelper.getStorageCards(snapshot()).firstNotNullOfOrNull { card ->
                                 val storage = NetworkStorageHelper.getFluidStorage(level, card)
                                 if (storage != null) {
                                     val has = damien.nodeworks.platform.PlatformServices.storage.countFluid(storage) { it == info.fluidId }
@@ -1502,7 +1737,7 @@ class ScriptEngine(
                 val result = LuaTable()
                 var idx = 1
                 if (kindGate == null || kindGate == damien.nodeworks.platform.ResourceKind.ITEM) {
-                    val allItems = NetworkStorageHelper.findAllItemInfoAcrossNetwork(level, snapshot, filter)
+                    val allItems = NetworkStorageHelper.findAllItemInfoAcrossNetwork(level, snapshot(), filter)
                     if (allItems.size > MAX_FINDEACH_RESULTS) {
                         throw LuaError(
                             "network:findEach('$filter') matched ${allItems.size} distinct items, " +
@@ -1513,7 +1748,7 @@ class ScriptEngine(
                     for (pair in allItems) {
                         val (info, _) = pair
                         val sourceStorage: () -> damien.nodeworks.platform.ItemStorageHandle? = {
-                            NetworkStorageHelper.getStorageCards(snapshot).firstNotNullOfOrNull { card ->
+                            NetworkStorageHelper.getStorageCards(snapshot()).firstNotNullOfOrNull { card ->
                                 val storage = NetworkStorageHelper.getStorage(level, card)
                                 if (storage != null) {
                                     val has = damien.nodeworks.platform.PlatformServices.storage.countItems(storage) { it == info.itemId }
@@ -1528,7 +1763,7 @@ class ScriptEngine(
                 if (kindGate == null || kindGate == damien.nodeworks.platform.ResourceKind.FLUID) {
                     // Single-pass aggregation, avoids O(N*M) rescans from calling countFluid
                     // per discovered fluid id.
-                    val allFluids = NetworkStorageHelper.findAllFluidInfoAcrossNetwork(level, snapshot, filter)
+                    val allFluids = NetworkStorageHelper.findAllFluidInfoAcrossNetwork(level, snapshot(), filter)
                     if (idx - 1 + allFluids.size > MAX_FINDEACH_RESULTS) {
                         throw LuaError(
                             "network:findEach('$filter') matched ${idx - 1 + allFluids.size} distinct resources, " +
@@ -1537,7 +1772,7 @@ class ScriptEngine(
                     }
                     for ((info, _) in allFluids) {
                         val fluidSource: () -> damien.nodeworks.platform.FluidStorageHandle? = {
-                            NetworkStorageHelper.getStorageCards(snapshot).firstNotNullOfOrNull { c ->
+                            NetworkStorageHelper.getStorageCards(snapshot()).firstNotNullOfOrNull { c ->
                                 val s = NetworkStorageHelper.getFluidStorage(level, c)
                                 if (s != null) {
                                     val has = damien.nodeworks.platform.PlatformServices.storage.countFluid(s) { it == info.fluidId }
@@ -1557,7 +1792,7 @@ class ScriptEngine(
         networkTable.setGuarded("Network", "count", object : TwoArgFunction() {
             override fun call(selfArg: LuaValue, filterArg: LuaValue): LuaValue {
                 val filter = filterArg.checkjstring()
-                val count = NetworkStorageHelper.countResource(level, snapshot, filter)
+                val count = NetworkStorageHelper.countResource(level, snapshot(), filter)
                 return LuaValue.valueOf(count.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
             }
         })
@@ -1571,7 +1806,7 @@ class ScriptEngine(
             "network:insert",
             consume = { b, tick -> b.tryConsumeItemMoveCall(tick) },
             warnOp = NetworkBudget.WARN_ITEM_MOVE,
-            buildNetworkInsertFn(snapshot, atomic = true),
+            buildNetworkInsertFn(atomic = true),
             onLimit = LuaValue.FALSE,
         ))
 
@@ -1582,7 +1817,7 @@ class ScriptEngine(
             "network:tryInsert",
             consume = { b, tick -> b.tryConsumeItemMoveCall(tick) },
             warnOp = NetworkBudget.WARN_ITEM_MOVE,
-            buildNetworkInsertFn(snapshot, atomic = false),
+            buildNetworkInsertFn(atomic = false),
             onLimit = LuaValue.valueOf(0),
         ))
 
@@ -1605,7 +1840,7 @@ class ScriptEngine(
                 // hands them to a `:connect(fn)` callback or runs the auto-store path
                 // (which uses [releaseCraftResult] and drops any overflow in-world).
                 val result = CraftingHelper.craft(
-                    identifier, count, level, snapshot,
+                    identifier, count, level, snapshot(),
                     cache = inventoryCache,
                     processingHandlers = processingHandlers.takeIf { it.isNotEmpty() },
                     callerScheduler = scheduler,
@@ -1634,8 +1869,8 @@ class ScriptEngine(
                     val item = if (id != null) net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(id) else null
                     val name = if (item != null) net.minecraft.world.item.ItemStack(item).hoverName.string else identifier
                     CraftingHelper.CraftResult(identifier, name, count,
-                        cpu = snapshot.cpus.firstOrNull()?.let { level.getBlockEntity(it.pos) as? damien.nodeworks.block.entity.CraftingCoreBlockEntity },
-                        level = level, snapshot = snapshot, cache = inventoryCache)
+                        cpu = snapshot().cpus.firstOrNull()?.let { level.getBlockEntity(it.pos) as? damien.nodeworks.block.entity.CraftingCoreBlockEntity },
+                        level = level, snapshot = snapshot(), cache = inventoryCache)
                 }
 
                 // Auto-store path: release CPU buffer → storage. Used when no `:connect`
@@ -1798,7 +2033,7 @@ class ScriptEngine(
         networkTable.setGuarded("Network", "route", object : TwoArgFunction() {
             override fun call(selfArg: LuaValue, aliasArg: LuaValue): LuaValue {
                 val pattern = aliasArg.checkjstring()
-                return StorageCardConfigurator.createBuilder(level, snapshot, pattern)
+                return StorageCardConfigurator.createBuilder(level, snapshot(), pattern)
             }
         })
 
@@ -1824,10 +2059,10 @@ class ScriptEngine(
 
                 if (ingredients.isEmpty()) throw LuaError("shapeless requires at least one item")
 
-                val result = ShapelessCraftHelper.craft(ingredients, level, snapshot, cache = inventoryCache)
+                val result = ShapelessCraftHelper.craft(ingredients, level, snapshot(), cache = inventoryCache)
                     ?: return LuaValue.NIL
 
-                val storageCards2 = NetworkStorageHelper.getStorageCards(snapshot)
+                val storageCards2 = NetworkStorageHelper.getStorageCards(snapshot())
                 val sourceStorage2: () -> damien.nodeworks.platform.ItemStorageHandle? = {
                     storageCards2.firstNotNullOfOrNull { card ->
                         val storage = NetworkStorageHelper.getStorage(level, card)
@@ -1872,9 +2107,9 @@ class ScriptEngine(
             override fun call(selfArg: LuaValue): LuaValue {
                 val sb = StringBuilder()
                 sb.appendLine("=== Network Debug ===")
-                sb.appendLine("Controller: ${snapshot.controller?.pos ?: "none"}")
-                sb.appendLine("Nodes: ${snapshot.nodes.size}")
-                for (node in snapshot.nodes) {
+                sb.appendLine("Controller: ${snapshot().controller?.pos ?: "none"}")
+                sb.appendLine("Nodes: ${snapshot().nodes.size}")
+                for (node in snapshot().nodes) {
                     val cardCount = node.sides.values.sumOf { it.size }
                     sb.appendLine("  Node ${node.pos}: $cardCount cards")
                     for ((dir, cards) in node.sides) {
@@ -1883,17 +2118,17 @@ class ScriptEngine(
                         }
                     }
                 }
-                sb.appendLine("Terminals: ${snapshot.terminalPositions.size}")
-                for (pos in snapshot.terminalPositions) sb.appendLine("  $pos")
-                sb.appendLine("CPUs: ${snapshot.cpus.size}")
-                for (cpu in snapshot.cpus) sb.appendLine("  ${cpu.pos}: ${cpu.bufferUsed}/${cpu.bufferCapacity} ${if (cpu.isBusy) "BUSY" else "idle"}")
-                sb.appendLine("Crafters (Instruction Sets): ${snapshot.crafters.size}")
-                for (crafter in snapshot.crafters) {
+                sb.appendLine("Terminals: ${snapshot().terminalPositions.size}")
+                for (pos in snapshot().terminalPositions) sb.appendLine("  $pos")
+                sb.appendLine("CPUs: ${snapshot().cpus.size}")
+                for (cpu in snapshot().cpus) sb.appendLine("  ${cpu.pos}: ${cpu.bufferUsed}/${cpu.bufferCapacity} ${if (cpu.isBusy) "BUSY" else "idle"}")
+                sb.appendLine("Crafters (Instruction Sets): ${snapshot().crafters.size}")
+                for (crafter in snapshot().crafters) {
                     sb.appendLine("  ${crafter.pos}: ${crafter.instructionSets.size} recipes")
                     for (recipe in crafter.instructionSets) sb.appendLine("    ${recipe.alias ?: recipe.outputItemId}")
                 }
-                sb.appendLine("Processing APIs: ${snapshot.processingApis.size}")
-                for (api in snapshot.processingApis) {
+                sb.appendLine("Processing APIs: ${snapshot().processingApis.size}")
+                for (api in snapshot().processingApis) {
                     val remote = if (api.remoteTerminalPositions != null) " (remote)" else ""
                     sb.appendLine("  ${api.pos}$remote: ${api.apis.size} cards")
                     for (card in api.apis) {
@@ -1902,14 +2137,19 @@ class ScriptEngine(
                         sb.appendLine("    [${card.name}] $inputs -> $outputs")
                     }
                 }
-                sb.appendLine("Variables: ${snapshot.variables.size}")
-                for (v in snapshot.variables) sb.appendLine("  ${v.name} (${v.type})")
+                sb.appendLine("Variables: ${snapshot().variables.size}")
+                for (v in snapshot().variables) sb.appendLine("  ${v.name} (${v.type})")
                 logCallback(sb.toString().trimEnd(), false)
                 return LuaValue.NIL
             }
         })
 
         g.set("network", networkTable)
+
+        val userModeTable = LuaTable()
+        userModeTable.set("INSTANT", LuaValue.valueOf("instant"))
+        userModeTable.set("HOLD", LuaValue.valueOf("hold"))
+        g.set("UserMode", userModeTable)
 
         // importer / stocker presets, declarative builders that compile down to
         // scheduler tasks. See damien/nodeworks/script/preset/*.kt.

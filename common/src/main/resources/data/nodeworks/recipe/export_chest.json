@@ -1,0 +1,19 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "CPC",
+    "DHD",
+    "CNC"
+  ],
+  "key": {
+    "C": "minecraft:redstone",
+    "H": "#c:chests/wooden",
+    "P": "minecraft:piston",
+    "D": "minecraft:deepslate",
+    "N": "nodeworks:node"
+  },
+  "result": {
+    "id": "nodeworks:export_chest",
+    "count": 1
+  }
+}

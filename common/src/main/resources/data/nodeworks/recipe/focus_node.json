@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "EDE",
+    "DND",
+    "EDE"
+  ],
+  "key": {
+    "E": "minecraft:popped_chorus_fruit",
+    "D": "minecraft:deepslate",
+    "N": "nodeworks:node"
+  },
+  "result": {
+    "id": "nodeworks:focus_node",
+    "count": 1
+  }
+}

@@ -53,6 +53,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         PlatformServices.storage = NeoForgeStorageService()
         PlatformServices.modState = NeoForgeModStateService()
         PlatformServices.fakePlayer = damien.nodeworks.platform.NeoForgeFakePlayerService()
+        PlatformServices.serverNetworking = NeoForgeServerNetworkingService()
 
         // Register the server-scoped config. Per-world file at
         // `serverconfig/nodeworks-server.toml` is auto-generated on first load
@@ -69,6 +70,10 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
 
         // Register payloads on the mod event bus
         modBus.addListener(::registerPayloads)
+
+        // Expose Item-handler capability for our Container BEs. Without this,
+        // hoppers and the Export Chest's push side can't see them as inventories.
+        modBus.addListener(::onRegisterCapabilities)
 
         // Register game events on the NeoForge event bus
         NeoForge.EVENT_BUS.addListener(::onServerTick)
@@ -285,7 +290,46 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                     damien.nodeworks.screen.PlacerMenu.clientFactory(syncId, inv, data)
                 }
             )
+            ModScreenHandlers.IMPORT_CHEST = Registry.register(
+                BuiltInRegistries.MENU,
+                ResourceKey.create(Registries.MENU, Identifier.fromNamespaceAndPath("nodeworks", "import_chest")),
+                IMenuTypeExtension.create { syncId, inv, buf ->
+                    val data = damien.nodeworks.screen.ImportChestOpenData.STREAM_CODEC.decode(buf)
+                    damien.nodeworks.screen.ImportChestMenu.clientFactory(syncId, inv, data)
+                }
+            )
+            ModScreenHandlers.EXPORT_CHEST = Registry.register(
+                BuiltInRegistries.MENU,
+                ResourceKey.create(Registries.MENU, Identifier.fromNamespaceAndPath("nodeworks", "export_chest")),
+                IMenuTypeExtension.create { syncId, inv, buf ->
+                    val data = damien.nodeworks.screen.ExportChestOpenData.STREAM_CODEC.decode(buf)
+                    damien.nodeworks.screen.ExportChestMenu.clientFactory(syncId, inv, data)
+                }
+            )
+            ModScreenHandlers.USER = Registry.register(
+                BuiltInRegistries.MENU,
+                ResourceKey.create(Registries.MENU, Identifier.fromNamespaceAndPath("nodeworks", "user")),
+                IMenuTypeExtension.create { syncId, inv, buf ->
+                    val data = damien.nodeworks.screen.UserOpenData.STREAM_CODEC.decode(buf)
+                    damien.nodeworks.screen.UserMenu.clientFactory(syncId, inv, data)
+                }
+            )
             ModScreenHandlers.initialize()
+        }
+    }
+
+    /** Register the new ResourceHandler-based item capability for our chest BEs.
+     *  Vanilla chest BEs are registered automatically by NeoForge, mod BEs that
+     *  implement [net.minecraft.world.Container] need explicit wiring or external
+     *  inserters (hoppers, the Export Chest's `pushToAdjacent`) silently see the
+     *  block as a no-op. */
+    private fun onRegisterCapabilities(event: net.neoforged.neoforge.capabilities.RegisterCapabilitiesEvent) {
+        val itemBlock = net.neoforged.neoforge.capabilities.Capabilities.Item.BLOCK
+        event.registerBlockEntity(itemBlock, ModBlockEntities.IMPORT_CHEST) { be, _ ->
+            net.neoforged.neoforge.transfer.item.VanillaContainerWrapper.of(be)
+        }
+        event.registerBlockEntity(itemBlock, ModBlockEntities.EXPORT_CHEST) { be, _ ->
+            net.neoforged.neoforge.transfer.item.VanillaContainerWrapper.of(be)
         }
     }
 
@@ -445,12 +489,64 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                         when (payload.key) {
                             "name" -> entity.deviceName = payload.strValue
                             "channel" -> if (newColor != null) entity.channel = newColor
+                            "filter" -> entity.filterRule = payload.strValue
+                                .take(damien.nodeworks.screen.BreakerOpenData.MAX_FILTER_LENGTH)
+                            "redstone" -> entity.redstoneMode = payload.intValue.coerceIn(0, 2)
+                            "preview" -> entity.previewArea = payload.intValue != 0
                         }
                     }
                     is damien.nodeworks.block.entity.PlacerBlockEntity -> {
                         when (payload.key) {
                             "name" -> entity.deviceName = payload.strValue
                             "channel" -> if (newColor != null) entity.channel = newColor
+                            "filter" -> entity.filterRule = payload.strValue
+                                .take(damien.nodeworks.screen.PlacerOpenData.MAX_FILTER_LENGTH)
+                            "redstone" -> entity.redstoneMode = payload.intValue.coerceIn(0, 2)
+                            "preview" -> entity.previewArea = payload.intValue != 0
+                        }
+                    }
+                    is damien.nodeworks.block.entity.ImportChestBlockEntity -> {
+                        when (payload.key) {
+                            "channel" -> entity.channel = damien.nodeworks.network.ChannelFilter.fromNbtInt(payload.intValue)
+                            "redstone" -> entity.redstoneMode = payload.intValue.coerceIn(0, 2)
+                            "roundRobin" -> entity.roundRobin = payload.intValue != 0
+                            "tickInterval" -> entity.tickInterval = payload.intValue.coerceIn(
+                                damien.nodeworks.block.entity.ImportChestBlockEntity.MIN_TICK_INTERVAL,
+                                damien.nodeworks.block.entity.ImportChestBlockEntity.MAX_TICK_INTERVAL,
+                            )
+                        }
+                    }
+                    is damien.nodeworks.block.entity.ExportChestBlockEntity -> {
+                        when (payload.key) {
+                            "channel" -> entity.channel = damien.nodeworks.network.ChannelFilter.fromNbtInt(payload.intValue)
+                            "pushFace" -> entity.pushFace = if (payload.intValue < 0) null
+                                else net.minecraft.core.Direction.entries.getOrNull(payload.intValue)
+                            "redstone" -> entity.redstoneMode = payload.intValue.coerceIn(0, 2)
+                            "tickInterval" -> entity.tickInterval = payload.intValue.coerceIn(
+                                damien.nodeworks.block.entity.ExportChestBlockEntity.MIN_TICK_INTERVAL,
+                                damien.nodeworks.block.entity.ExportChestBlockEntity.MAX_TICK_INTERVAL,
+                            )
+                        }
+                    }
+                    is damien.nodeworks.block.entity.UserBlockEntity -> {
+                        when (payload.key) {
+                            "name" -> entity.deviceName = payload.strValue
+                            "channel" -> if (newColor != null) entity.channel = newColor
+                            "filter" -> entity.filterRule = payload.strValue
+                                .take(damien.nodeworks.screen.UserOpenData.MAX_FILTER_LENGTH)
+                            "redstone" -> entity.redstoneMode = payload.intValue.coerceIn(0, 2)
+                            "mode" -> {
+                                // Coerce explicitly so an out-of-range payload
+                                // doesn't silently route to INSTANT, matches
+                                // the `redstone` pattern above.
+                                val ord = payload.intValue.coerceIn(
+                                    0,
+                                    damien.nodeworks.block.entity.UserBlockEntity.UseMode.entries.size - 1,
+                                )
+                                entity.mode =
+                                    damien.nodeworks.block.entity.UserBlockEntity.UseMode.entries[ord]
+                            }
+                            "preview" -> entity.previewArea = payload.intValue != 0
                         }
                     }
                 }
@@ -493,6 +589,26 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                 if (menu is damien.nodeworks.screen.StorageCardMenu && menu.containerId == payload.containerId) {
                     menu.replaceFilterRules(payload.rules)
                 }
+            }
+        }
+
+        registrar.playToServer(
+            damien.nodeworks.network.SetExportChestFilterRulesPayload.TYPE,
+            damien.nodeworks.network.SetExportChestFilterRulesPayload.CODEC,
+        ) { payload, context ->
+            context.enqueueWork {
+                val player = context.player()
+                val menu = player.containerMenu as? damien.nodeworks.screen.ExportChestMenu ?: return@enqueueWork
+                if (menu.containerId != payload.containerId) return@enqueueWork
+                // 8 m proximity gate, matches DeviceSettingsPayload's check on
+                // the same chest's other settings. Without it, players up to
+                // the menu's 64 m stillValid range could spam filter-rule
+                // changes from beyond the design's settings range.
+                if (!player.blockPosition().closerThan(menu.devicePos, 8.0)) return@enqueueWork
+                val level = player.level() as? ServerLevel ?: return@enqueueWork
+                val entity = level.getBlockEntity(menu.devicePos) as? damien.nodeworks.block.entity.ExportChestBlockEntity ?: return@enqueueWork
+                entity.filterRules = payload.rules
+                menu.applyFilterRulesFromServer(payload.rules)
             }
         }
 
@@ -661,6 +777,18 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                 damien.nodeworks.script.ClientServerPolicy.update(payload.enabledModules, payload.disabledMethods)
             }
         }
+
+        registrar.playToClient(NetworkIdBatchPayload.TYPE, NetworkIdBatchPayload.CODEC) { payload, context ->
+            context.enqueueWork {
+                val level = net.minecraft.client.Minecraft.getInstance().level ?: return@enqueueWork
+                for (pos in payload.positions) {
+                    if (!level.isLoaded(pos)) continue
+                    val be = level.getBlockEntity(pos) as? damien.nodeworks.network.Connectable ?: continue
+                    be.networkId = payload.newId
+                }
+                damien.nodeworks.network.NetworkSettingsRegistry.notifyConnectableChanged(payload.newId)
+            }
+        }
     }
 
     private fun onServerTick(event: ServerTickEvent.Post) {
@@ -701,8 +829,8 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         damien.nodeworks.script.NetworkRateLimits.clearAll()
     }
 
-    private fun onPlayerDisconnect(event: PlayerEvent.PlayerLoggedOutEvent) {
-        NetworkWrenchItem.clearSelection(event.entity.uuid)
+    private fun onPlayerDisconnect(event: net.neoforged.neoforge.event.entity.player.PlayerEvent.PlayerLoggedOutEvent) {
+        damien.nodeworks.item.NetworkWrenchItem.clearSelection(event.entity.uuid)
     }
 
     private fun onRightClickBlock(event: net.neoforged.neoforge.event.entity.player.PlayerInteractEvent.RightClickBlock) {

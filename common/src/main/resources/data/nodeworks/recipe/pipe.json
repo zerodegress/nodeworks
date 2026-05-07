@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "DGD",
+    "DCD",
+    "DGD"
+  ],
+  "key": {
+    "C": "nodeworks:celestine_shard",
+    "D": "minecraft:deepslate",
+    "G": "#c:glass_panes"
+  },
+  "result": {
+    "id": "nodeworks:pipe",
+    "count": 4
+  }
+}

@@ -8,7 +8,11 @@ import damien.nodeworks.registry.ModScreenHandlers
 import damien.nodeworks.screen.InstructionSetScreenHandler
 import damien.nodeworks.screen.ProcessingSetScreen
 import damien.nodeworks.screen.ProcessingSetScreenHandler
+import damien.nodeworks.screen.BreakerScreen
+import damien.nodeworks.screen.ExportChestScreen
+import damien.nodeworks.screen.PlacerScreen
 import damien.nodeworks.screen.StorageCardScreen
+import damien.nodeworks.screen.UserScreen
 import mezz.jei.api.IModPlugin
 import mezz.jei.api.JeiPlugin
 import mezz.jei.api.constants.RecipeTypes
@@ -101,6 +105,22 @@ class NodeworksJeiPlugin : IModPlugin {
         registration.addGhostIngredientHandler(
             StorageCardScreen::class.java,
             StorageCardGhostHandler()
+        )
+        registration.addGhostIngredientHandler(
+            ExportChestScreen::class.java,
+            ExportChestGhostHandler()
+        )
+        registration.addGhostIngredientHandler(
+            UserScreen::class.java,
+            UserGhostHandler()
+        )
+        registration.addGhostIngredientHandler(
+            BreakerScreen::class.java,
+            BreakerGhostHandler()
+        )
+        registration.addGhostIngredientHandler(
+            PlacerScreen::class.java,
+            PlacerGhostHandler()
         )
     }
 
@@ -478,6 +498,132 @@ class StorageCardGhostHandler : IGhostIngredientHandler<StorageCardScreen> {
 
     private class StorageCardRuleTarget<I : Any>(
         private val gui: StorageCardScreen,
+        private val area: Rect2i,
+    ) : IGhostIngredientHandler.Target<I> {
+        override fun getArea(): Rect2i = area
+        override fun accept(ingredient: I) {
+            if (ingredient !is ItemStack || ingredient.isEmpty) return
+            val itemId = BuiltInRegistries.ITEM.getKey(ingredient.item)?.toString() ?: return
+            gui.acceptGhostItem(itemId)
+        }
+    }
+}
+
+/**
+ * Mirror of [StorageCardGhostHandler] for the Export Chest GUI: a single drop
+ * area covering the rule list panel appends the dropped item's id as a new
+ * filter rule.
+ */
+class ExportChestGhostHandler : IGhostIngredientHandler<ExportChestScreen> {
+
+    override fun <I : Any> getTargetsTyped(
+        gui: ExportChestScreen,
+        ingredient: ITypedIngredient<I>,
+        doStart: Boolean
+    ): List<IGhostIngredientHandler.Target<I>> {
+        if (ingredient.ingredient !is ItemStack) return emptyList()
+        val rect = gui.rulePanelDropArea() ?: return emptyList()
+        return listOf(ExportChestRuleTarget(gui, Rect2i(rect[0], rect[1], rect[2], rect[3])))
+    }
+
+    override fun onComplete() {}
+
+    private class ExportChestRuleTarget<I : Any>(
+        private val gui: ExportChestScreen,
+        private val area: Rect2i,
+    ) : IGhostIngredientHandler.Target<I> {
+        override fun getArea(): Rect2i = area
+        override fun accept(ingredient: I) {
+            if (ingredient !is ItemStack || ingredient.isEmpty) return
+            val itemId = BuiltInRegistries.ITEM.getKey(ingredient.item)?.toString() ?: return
+            gui.acceptGhostItem(itemId)
+        }
+    }
+}
+
+/**
+ * Ghost-ingredient handler for the User device GUI. The filter row (icon + EditBox)
+ * is the single drop target; dropping replaces the filter with the dropped item's id.
+ */
+class UserGhostHandler : IGhostIngredientHandler<UserScreen> {
+
+    override fun <I : Any> getTargetsTyped(
+        gui: UserScreen,
+        ingredient: ITypedIngredient<I>,
+        doStart: Boolean
+    ): List<IGhostIngredientHandler.Target<I>> {
+        if (ingredient.ingredient !is ItemStack) return emptyList()
+        val rect = gui.filterDropArea() ?: return emptyList()
+        return listOf(UserFilterTarget(gui, Rect2i(rect[0], rect[1], rect[2], rect[3])))
+    }
+
+    override fun onComplete() {}
+
+    private class UserFilterTarget<I : Any>(
+        private val gui: UserScreen,
+        private val area: Rect2i,
+    ) : IGhostIngredientHandler.Target<I> {
+        override fun getArea(): Rect2i = area
+        override fun accept(ingredient: I) {
+            if (ingredient !is ItemStack || ingredient.isEmpty) return
+            val itemId = BuiltInRegistries.ITEM.getKey(ingredient.item)?.toString() ?: return
+            gui.acceptGhostItem(itemId)
+        }
+    }
+}
+
+/**
+ * Mirror of [UserGhostHandler] for the Breaker GUI: a single drop area
+ * covering the filter row replaces the Breaker's filter with the dropped
+ * item's id (the registry id of the block that drops the item, in most
+ * cases - users typing block ids directly remains the explicit path).
+ */
+class BreakerGhostHandler : IGhostIngredientHandler<BreakerScreen> {
+
+    override fun <I : Any> getTargetsTyped(
+        gui: BreakerScreen,
+        ingredient: ITypedIngredient<I>,
+        doStart: Boolean
+    ): List<IGhostIngredientHandler.Target<I>> {
+        if (ingredient.ingredient !is ItemStack) return emptyList()
+        val rect = gui.filterDropArea() ?: return emptyList()
+        return listOf(BreakerFilterTarget(gui, Rect2i(rect[0], rect[1], rect[2], rect[3])))
+    }
+
+    override fun onComplete() {}
+
+    private class BreakerFilterTarget<I : Any>(
+        private val gui: BreakerScreen,
+        private val area: Rect2i,
+    ) : IGhostIngredientHandler.Target<I> {
+        override fun getArea(): Rect2i = area
+        override fun accept(ingredient: I) {
+            if (ingredient !is ItemStack || ingredient.isEmpty) return
+            val itemId = BuiltInRegistries.ITEM.getKey(ingredient.item)?.toString() ?: return
+            gui.acceptGhostItem(itemId)
+        }
+    }
+}
+
+/**
+ * Mirror of [BreakerGhostHandler] for the Placer GUI.
+ */
+class PlacerGhostHandler : IGhostIngredientHandler<PlacerScreen> {
+
+    override fun <I : Any> getTargetsTyped(
+        gui: PlacerScreen,
+        ingredient: ITypedIngredient<I>,
+        doStart: Boolean
+    ): List<IGhostIngredientHandler.Target<I>> {
+        if (ingredient.ingredient !is ItemStack) return emptyList()
+        val rect = gui.filterDropArea() ?: return emptyList()
+        return listOf(PlacerFilterTarget(gui, Rect2i(rect[0], rect[1], rect[2], rect[3])))
+    }
+
+    override fun onComplete() {}
+
+    private class PlacerFilterTarget<I : Any>(
+        private val gui: PlacerScreen,
         private val area: Rect2i,
     ) : IGhostIngredientHandler.Target<I> {
         override fun getArea(): Rect2i = area

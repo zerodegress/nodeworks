@@ -43,6 +43,7 @@ class StorageCard(properties: Properties) : NodeCard(properties) {
             nbtFilter = getNbtFilter(stack).ordinal,
             filterRules = getFilterRules(stack),
             cardName = cardName,
+            customSideOrdinal = getCustomSide(stack)?.ordinal ?: -1,
         )
         PlatformServices.menu.openExtendedMenu(
             serverPlayer,
@@ -58,13 +59,71 @@ class StorageCard(properties: Properties) : NodeCard(properties) {
         super.appendHoverText(stack, context, display, tooltip, flag)
         val priority = getPriority(stack)
         tooltip.accept(Component.literal("Priority: $priority").withStyle(ChatFormatting.GRAY))
+
+        // Face override is opt-in, omit the line entirely when the player
+        // hasn't picked one (so the default-touching-face card stays clean).
+        val customSide = getCustomSide(stack)
+        if (customSide != null) {
+            tooltip.accept(
+                Component.literal("Face: ${customSide.displayName}")
+                    .withStyle(ChatFormatting.GRAY),
+            )
+        }
+
+        // Single-line summary of the three filter dimensions so a quick hover
+        // reads at a glance whether the card is configured. All three default
+        // to "Any" / "Allow", so an unconfigured card reads cleanly too.
+        val mode = formatEnum(getFilterMode(stack).name)
+        val nbt = formatEnum(getNbtFilter(stack).name)
+        val stacking = formatEnum(getStackabilityFilter(stack).name)
+        tooltip.accept(
+            Component.literal("Mode=$mode  NBT=$nbt  Stacking=$stacking")
+                .withStyle(ChatFormatting.GRAY),
+        )
+
+        // Rules: omitted entirely on an unconfigured card. Cap at 3 visible
+        // entries with a trailing "..." so a 32-rule card doesn't blow the
+        // tooltip off the screen.
+        val rules = getFilterRules(stack)
+        if (rules.isNotEmpty()) {
+            tooltip.accept(Component.literal("Rules:").withStyle(ChatFormatting.GRAY))
+            val visible = rules.take(MAX_TOOLTIP_RULES)
+            for (rule in visible) {
+                tooltip.accept(
+                    Component.literal("    $rule").withStyle(ChatFormatting.DARK_GRAY),
+                )
+            }
+            if (rules.size > MAX_TOOLTIP_RULES) {
+                tooltip.accept(
+                    Component.literal("    ...").withStyle(ChatFormatting.DARK_GRAY),
+                )
+            }
+        }
     }
 
+    /** "ALLOW" → "Allow", "HAS_DATA" → "Has Data". Single helper so the three
+     *  filter dimensions render with the same casing convention. */
+    private fun formatEnum(name: String): String =
+        name.split('_').joinToString(" ") { word ->
+            word.lowercase().replaceFirstChar { it.uppercase() }
+        }
+
     companion object {
+        /** Cap on rules shown in the item tooltip. Anything beyond this is
+         *  collapsed into a trailing "..." so a card with the full
+         *  [StorageCardOpenData.MAX_RULES] worth of patterns doesn't push the
+         *  tooltip off-screen. */
+        private const val MAX_TOOLTIP_RULES = 3
+
         private const val FILTER_MODE_KEY = "filterMode"
         private const val FILTER_RULES_KEY = "filterRules"
         private const val FILTER_STACK_KEY = "filterStack"
         private const val FILTER_NBT_KEY = "filterNbt"
+        /** Optional player-chosen face override. Persisted as the [RelDir.name]
+         *  string (e.g. "UP" / "FRONT"). Absent key = use the default face
+         *  ([NodeBlockEntity.getSideCapabilities] resolves to the node-side's
+         *  opposite, the face touching the node). */
+        private const val CUSTOM_SIDE_KEY = "customSide"
 
         /** Filter mode controls whether the rule list whitelists or blacklists items.
          *  An empty rule list means "accept everything" regardless of mode, so the
@@ -175,6 +234,26 @@ class StorageCard(properties: Properties) : NodeCard(properties) {
             } else {
                 tag.putString(FILTER_NBT_KEY, mode.name)
             }
+            stack.set(DataComponents.CUSTOM_DATA, CustomData.of(tag))
+        }
+
+        /** Player-chosen face override. Null = use the default (face touching
+         *  the node). Persisted as [damien.nodeworks.screen.widget.RelDir.name]
+         *  in CUSTOM_DATA. The actual world [net.minecraft.core.Direction] is
+         *  resolved at capability build-time using the node side the card is
+         *  mounted on. */
+        fun getCustomSide(stack: ItemStack): damien.nodeworks.screen.widget.RelDir? {
+            val customData = stack.get(DataComponents.CUSTOM_DATA) ?: return null
+            val raw = customData.copyTag().getStringOr(CUSTOM_SIDE_KEY, "")
+            if (raw.isEmpty()) return null
+            return runCatching { damien.nodeworks.screen.widget.RelDir.valueOf(raw) }.getOrNull()
+        }
+
+        fun setCustomSide(stack: ItemStack, side: damien.nodeworks.screen.widget.RelDir?) {
+            if (getCustomSide(stack) == side) return
+            val tag = stack.get(DataComponents.CUSTOM_DATA)?.copyTag() ?: CompoundTag()
+            if (side == null) tag.remove(CUSTOM_SIDE_KEY)
+            else tag.putString(CUSTOM_SIDE_KEY, side.name)
             stack.set(DataComponents.CUSTOM_DATA, CustomData.of(tag))
         }
     }

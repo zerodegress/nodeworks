@@ -1,0 +1,32 @@
+{
+  "replace": false,
+  "values": [
+    "nodeworks:node",
+    "nodeworks:focus_node",
+    "nodeworks:pipe",
+    "nodeworks:terminal",
+    "nodeworks:monitor",
+    "nodeworks:inventory_terminal",
+    "nodeworks:network_controller",
+    "nodeworks:breaker",
+    "nodeworks:placer",
+    "nodeworks:user",
+    "nodeworks:device_frame",
+    "nodeworks:variable",
+    "nodeworks:instruction_storage",
+    "nodeworks:processing_storage",
+    "nodeworks:crafting_core",
+    "nodeworks:crafting_storage",
+    "nodeworks:co_processor",
+    "nodeworks:stabilizer",
+    "nodeworks:substrate",
+    "nodeworks:broadcast_antenna",
+    "nodeworks:receiver_antenna",
+    "nodeworks:antenna_segment",
+    "nodeworks:import_chest",
+    "nodeworks:export_chest",
+    "nodeworks:celestine_block",
+    "nodeworks:budding_celestine",
+    "nodeworks:celestine_ore"
+  ]
+}

@@ -1,10 +1,12 @@
 package damien.nodeworks.registry
 
+import damien.nodeworks.block.entity.FocusNodeBlockEntity
 import damien.nodeworks.block.entity.InstructionStorageBlockEntity
 import damien.nodeworks.block.entity.InventoryTerminalBlockEntity
 import damien.nodeworks.block.entity.MonitorBlockEntity
 import damien.nodeworks.block.entity.NetworkControllerBlockEntity
 import damien.nodeworks.block.entity.NodeBlockEntity
+import damien.nodeworks.block.entity.PipeBlockEntity
 import damien.nodeworks.block.entity.TerminalBlockEntity
 import damien.nodeworks.block.entity.ProcessingStorageBlockEntity
 import damien.nodeworks.block.entity.BroadcastAntennaBlockEntity
@@ -15,7 +17,10 @@ import damien.nodeworks.block.entity.CraftingStorageBlockEntity
 import damien.nodeworks.block.entity.StabilizerBlockEntity
 import damien.nodeworks.block.entity.SubstrateBlockEntity
 import damien.nodeworks.block.entity.BreakerBlockEntity
+import damien.nodeworks.block.entity.ExportChestBlockEntity
+import damien.nodeworks.block.entity.ImportChestBlockEntity
 import damien.nodeworks.block.entity.PlacerBlockEntity
+import damien.nodeworks.block.entity.UserBlockEntity
 import damien.nodeworks.block.entity.VariableBlockEntity
 import damien.nodeworks.platform.PlatformServices
 import net.minecraft.core.Registry
@@ -31,6 +36,16 @@ object ModBlockEntities {
     val NODE: BlockEntityType<NodeBlockEntity> = register(
         "node",
         PlatformServices.blockEntity.createBlockEntityType(::NodeBlockEntity, ModBlocks.NODE)
+    )
+
+    val FOCUS_NODE: BlockEntityType<FocusNodeBlockEntity> = register(
+        "focus_node",
+        PlatformServices.blockEntity.createBlockEntityType(::FocusNodeBlockEntity, ModBlocks.FOCUS_NODE)
+    )
+
+    val PIPE: BlockEntityType<PipeBlockEntity> = register(
+        "pipe",
+        PlatformServices.blockEntity.createBlockEntityType(::PipeBlockEntity, ModBlocks.PIPE)
     )
 
     val TERMINAL: BlockEntityType<TerminalBlockEntity> = register(
@@ -111,6 +126,21 @@ object ModBlockEntities {
     val PLACER: BlockEntityType<PlacerBlockEntity> = register(
         "placer",
         PlatformServices.blockEntity.createBlockEntityType(::PlacerBlockEntity, ModBlocks.PLACER)
+    )
+
+    val USER: BlockEntityType<UserBlockEntity> = register(
+        "user",
+        PlatformServices.blockEntity.createBlockEntityType(::UserBlockEntity, ModBlocks.USER)
+    )
+
+    val IMPORT_CHEST: BlockEntityType<ImportChestBlockEntity> = register(
+        "import_chest",
+        PlatformServices.blockEntity.createBlockEntityType(::ImportChestBlockEntity, ModBlocks.IMPORT_CHEST)
+    )
+
+    val EXPORT_CHEST: BlockEntityType<ExportChestBlockEntity> = register(
+        "export_chest",
+        PlatformServices.blockEntity.createBlockEntityType(::ExportChestBlockEntity, ModBlocks.EXPORT_CHEST)
     )
 
     private fun <T : BlockEntity> register(
