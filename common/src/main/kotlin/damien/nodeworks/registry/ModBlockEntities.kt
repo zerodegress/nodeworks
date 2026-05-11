@@ -10,6 +10,7 @@ import damien.nodeworks.block.entity.PipeBlockEntity
 import damien.nodeworks.block.entity.TerminalBlockEntity
 import damien.nodeworks.block.entity.ProcessingStorageBlockEntity
 import damien.nodeworks.block.entity.BroadcastAntennaBlockEntity
+import damien.nodeworks.block.entity.CoveredPipeBlockEntity
 import damien.nodeworks.block.entity.CraftingCoreBlockEntity
 import damien.nodeworks.block.entity.ReceiverAntennaBlockEntity
 import damien.nodeworks.block.entity.CoProcessorBlockEntity
@@ -20,6 +21,7 @@ import damien.nodeworks.block.entity.BreakerBlockEntity
 import damien.nodeworks.block.entity.ExportChestBlockEntity
 import damien.nodeworks.block.entity.ImportChestBlockEntity
 import damien.nodeworks.block.entity.PlacerBlockEntity
+import damien.nodeworks.block.entity.ProcessingHandlerBlockEntity
 import damien.nodeworks.block.entity.UserBlockEntity
 import damien.nodeworks.block.entity.VariableBlockEntity
 import damien.nodeworks.platform.PlatformServices
@@ -46,6 +48,11 @@ object ModBlockEntities {
     val PIPE: BlockEntityType<PipeBlockEntity> = register(
         "pipe",
         PlatformServices.blockEntity.createBlockEntityType(::PipeBlockEntity, ModBlocks.PIPE)
+    )
+
+    val COVERED_PIPE: BlockEntityType<CoveredPipeBlockEntity> = register(
+        "covered_pipe",
+        PlatformServices.blockEntity.createBlockEntityType(::CoveredPipeBlockEntity, ModBlocks.COVERED_PIPE)
     )
 
     val TERMINAL: BlockEntityType<TerminalBlockEntity> = register(
@@ -141,6 +148,11 @@ object ModBlockEntities {
     val EXPORT_CHEST: BlockEntityType<ExportChestBlockEntity> = register(
         "export_chest",
         PlatformServices.blockEntity.createBlockEntityType(::ExportChestBlockEntity, ModBlocks.EXPORT_CHEST)
+    )
+
+    val PROCESSING_HANDLER: BlockEntityType<ProcessingHandlerBlockEntity> = register(
+        "processing_handler",
+        PlatformServices.blockEntity.createBlockEntityType(::ProcessingHandlerBlockEntity, ModBlocks.PROCESSING_HANDLER)
     )
 
     private fun <T : BlockEntity> register(

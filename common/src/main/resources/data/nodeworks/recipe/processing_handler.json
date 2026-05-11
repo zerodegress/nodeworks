@@ -1,0 +1,18 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "DND",
+    "ICI",
+    "DND"
+  ],
+  "key": {
+    "I": "minecraft:iron_ingot",
+    "C": "nodeworks:celestine_shard",
+    "D": "minecraft:deepslate",
+    "N": "nodeworks:node"
+  },
+  "result": {
+    "id": "nodeworks:processing_handler",
+    "count": 1
+  }
+}

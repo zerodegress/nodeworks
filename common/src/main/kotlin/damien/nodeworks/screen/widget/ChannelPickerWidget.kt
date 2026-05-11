@@ -41,8 +41,14 @@ class ChannelPickerWidget(
     initialColor: DyeColor,
     private val canBeNone: Boolean = false,
     initialIsNone: Boolean = false,
+    private val swatchSize: Int = SWATCH,
+    /** Optional override for the tooltip's first line. Receives the current
+     *  [DyeColor] and returns the line to render in place of the default
+     *  "Channel: {Color}". Useful when the picker drives a domain-specific
+     *  routing rule (e.g. "Routes to Blue Storage Cards"). */
+    private val tooltipFormatter: ((DyeColor) -> String)? = null,
     private val onChange: (DyeColor?) -> Unit,
-) : AbstractWidget(x, y, SWATCH, SWATCH, Component.literal("Channel")) {
+) : AbstractWidget(x, y, swatchSize, swatchSize, Component.literal("Channel")) {
 
     var currentColor: DyeColor = initialColor
         private set
@@ -84,24 +90,24 @@ class ChannelPickerWidget(
         // Slot frame, then either the dye-coloured fill or the "none" black-with-X
         // glyph. Border looks the same as Storage Card's priority slot, keeps the
         // GUI visually consistent.
-        NineSlice.SLOT.draw(graphics, x, y, SWATCH, SWATCH)
+        NineSlice.SLOT.draw(graphics, x, y, swatchSize, swatchSize)
         if (isNone) {
-            drawNoneGlyph(graphics, x, y, SWATCH)
+            drawNoneGlyph(graphics, x, y, swatchSize)
         } else {
             // White wool tinted with the dye colour fills the slot interior
             // (1 px inset on every side so the slot frame still reads). Gives
             // the swatch a wool texture instead of a flat fill while staying
             // chromatically identical to the picker grid below.
             val rgb = currentColor.textureDiffuseColor and 0xFFFFFF
-            Icons.WHITE_WOOL.drawTinted(graphics, x + 1, y + 1, SWATCH - 2, rgb)
+            Icons.WHITE_WOOL.drawTinted(graphics, x + 1, y + 1, swatchSize - 2, rgb)
         }
 
         // Hover outline so the player knows the swatch is interactive.
         if (isHovered) {
-            graphics.fill(x, y, x + SWATCH, y + 1, 0x80FFFFFF.toInt())
-            graphics.fill(x, y + SWATCH - 1, x + SWATCH, y + SWATCH, 0x80FFFFFF.toInt())
-            graphics.fill(x, y, x + 1, y + SWATCH, 0x80FFFFFF.toInt())
-            graphics.fill(x + SWATCH - 1, y, x + SWATCH, y + SWATCH, 0x80FFFFFF.toInt())
+            graphics.fill(x, y, x + swatchSize, y + 1, 0x80FFFFFF.toInt())
+            graphics.fill(x, y + swatchSize - 1, x + swatchSize, y + swatchSize, 0x80FFFFFF.toInt())
+            graphics.fill(x, y, x + 1, y + swatchSize, 0x80FFFFFF.toInt())
+            graphics.fill(x + swatchSize - 1, y, x + swatchSize, y + swatchSize, 0x80FFFFFF.toInt())
         }
     }
 
@@ -128,7 +134,7 @@ class ChannelPickerWidget(
         val h = gridH + noneH + POPUP_PAD * 2
         val px = x
         val screenH = Minecraft.getInstance().window.guiScaledHeight
-        val belowY = y + SWATCH + 2
+        val belowY = y + swatchSize + 2
         val aboveY = y - h - 2
         val py = if (belowY + h <= screenH) belowY else aboveY.coerceAtLeast(0)
         return intArrayOf(px, py, w, h)
@@ -227,8 +233,11 @@ class ChannelPickerWidget(
     private fun renderSwatchTooltip(graphics: GuiGraphicsExtractor, mouseX: Int, mouseY: Int) {
         if (mouseX !in x until x + width || mouseY !in y until y + height) return
         val font = Minecraft.getInstance().font
-        val firstLine = if (isNone) "All channels"
-            else "Channel: ${currentColor.name.lowercase().replaceFirstChar { it.uppercase() }}"
+        val firstLine = when {
+            isNone -> "All channels"
+            tooltipFormatter != null -> tooltipFormatter.invoke(currentColor)
+            else -> "Channel: ${currentColor.name.lowercase().replaceFirstChar { it.uppercase() }}"
+        }
         graphics.renderComponentTooltip(
             font,
             listOf(Component.literal(firstLine), Component.literal("Click to change.")),
@@ -281,7 +290,7 @@ class ChannelPickerWidget(
 
         // Outside grid (and outside swatch) → close. Returning true so the host
         // doesn't accidentally fire whatever's underneath the popup.
-        val swatchHit = mouseX >= x && mouseY >= y && mouseX < x + SWATCH && mouseY < y + SWATCH
+        val swatchHit = mouseX >= x && mouseY >= y && mouseX < x + swatchSize && mouseY < y + swatchSize
         if (!swatchHit) {
             expanded = false
             return true

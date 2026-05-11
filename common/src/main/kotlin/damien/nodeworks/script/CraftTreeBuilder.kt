@@ -141,7 +141,17 @@ object CraftTreeBuilder {
             val handlerEngine = PlatformServices.modState.findProcessingEngine(
                 level, searchPositions, api.name, apiMatch.apiStorage.remoteDimension
             )
-            val hasHandler = handlerEngine != null
+            // A recipe is considered "handled" when EITHER a Lua handler is
+            // registered on a connected Terminal OR a Processing Handler
+            // block is bound to it on the network the recipe lives on. For a
+            // local API that's [snapshot.networkId]; for a subnet API the
+            // handler is registered against the provider network's id, which
+            // [ProcessingApiSnapshot.remoteNetworkId] carries through from
+            // the broadcast antenna's discovery.
+            val handlerNetworkId = if (isSubnet) apiMatch.apiStorage.remoteNetworkId else snapshot.networkId
+            val hasBlockHandler =
+                damien.nodeworks.script.cpu.BlockHandlerRegistry.find(handlerNetworkId, api.name) != null
+            val hasHandler = handlerEngine != null || hasBlockHandler
 
             // Processing APIs can yield >1 per batch (e.g. a smelting handler that produces
             // 9 nuggets per ingot). Round request up to a whole batch, same as Instruction Sets.

@@ -7,6 +7,7 @@ import damien.nodeworks.block.UserBlock
 import damien.nodeworks.block.entity.UserBlockEntity
 import damien.nodeworks.client.UserArmModel
 import damien.nodeworks.client.UserEmissiveModel
+import damien.nodeworks.network.NetworkSettingsRegistry
 import net.minecraft.client.renderer.Sheets
 import net.minecraft.client.renderer.SubmitNodeCollector
 import net.minecraft.client.renderer.block.dispatch.BlockStateModelPart
@@ -58,6 +59,12 @@ open class UserRenderer(context: BlockEntityRendererProvider.Context) :
          *  no-network grey so disconnected Users render dark instead of
          *  picking up a stale tint. */
         var networkColor: Int = NodeConnectionRenderer.DEFAULT_NETWORK_COLOR
+
+        /** Network laser mode (FANCY vs FAST) and connectivity flag, mirroring
+         *  the fields PipeRenderer / NodeRenderer cache for [PipeLaserBeam]. */
+        var laserMode: Int = NetworkSettingsRegistry.LASER_MODE_FANCY
+        var hasNetwork: Boolean = false
+        var isMicro: Boolean = false
     }
 
     override fun createRenderState(): RenderState = RenderState()
@@ -70,22 +77,25 @@ open class UserRenderer(context: BlockEntityRendererProvider.Context) :
         breakProgress: ModelFeatureRenderer.CrumblingOverlay?,
     ) {
         state.facing = blockEntity.blockState.getValue(UserBlock.FACING)
-        state.extension = computeExtension(blockEntity, partialTicks)
         state.networkColor = resolveNetworkColor(blockEntity)
+        val id = blockEntity.networkId
+        val settings = NetworkSettingsRegistry.get(id)
+        state.laserMode = settings.laserMode
+        state.hasNetwork = id != null
+        state.isMicro = MicroNetworkClientRegistry.isMicro(id)
 
-        // Render the item only while the device actively has it on hand:
-        // EXTEND phase ([scheduleUse] reserved it into heldStack) + HOLD
-        // phase. INSTANT-mode RETRACT and idle states leave heldStack empty,
-        // so the holder visually empties as soon as the item goes back to
-        // network storage at apex.
-        val displayStack = blockEntity.heldStack
-        state.hasItem = !displayStack.isEmpty
-        if (state.hasItem) {
-            itemModelResolver.updateForTopItem(
-                state.itemRS, displayStack, ItemDisplayContext.GROUND,
-                blockEntity.level, null, 0,
-            )
-        }
+        // Arm + held item temporarily disabled for an animation-less model
+        // test. Re-enable by uncommenting both this block and the matching
+        // arm-submit block in [submitConnectable].
+        // state.extension = computeExtension(blockEntity, partialTicks)
+        // val displayStack = blockEntity.heldStack
+        // state.hasItem = !displayStack.isEmpty
+        // if (state.hasItem) {
+        //     itemModelResolver.updateForTopItem(
+        //         state.itemRS, displayStack, ItemDisplayContext.GROUND,
+        //         blockEntity.level, null, 0,
+        //     )
+        // }
     }
 
     override fun submitConnectable(
@@ -94,6 +104,27 @@ open class UserRenderer(context: BlockEntityRendererProvider.Context) :
         submitNodeCollector: SubmitNodeCollector,
         camera: CameraRenderState,
     ) {
+        // Tiny network-coloured laser stub inside the body. Runs from block
+        // centre toward the FRONT face for [INNER_LASER_HALF_LENGTH] block
+        // units, so the visible span sits at pixels 3..8 along the
+        // front-back axis - inside the model's throat region where the
+        // cauldron-style opening lets the player see it. The back half is a
+        // solid 12×12 body element and would hide the beam if we drew it
+        // toward the actual network-connection face.
+        if (state.hasNetwork) {
+            PipeLaserBeam.submitStub(
+                poseStack,
+                submitNodeCollector,
+                state.pos,
+                camera.pos,
+                dir = state.facing,
+                color = state.networkColor,
+                laserMode = state.laserMode,
+                halfLength = INNER_LASER_HALF_LENGTH,
+                isMicro = state.isMicro,
+            )
+        }
+
         // Network-coloured emissive overlay on the body. user_emissive.json
         // inherits user.json's elements + per-face UVs (only the texture
         // ref differs), so iterating its baked quads through the additive-
@@ -118,36 +149,32 @@ open class UserRenderer(context: BlockEntityRendererProvider.Context) :
             poseStack.popPose()
         }
 
-        val armModel = UserArmModel.get() ?: return
-
-        // Pose convention mirrors MonitorRenderer: translate to block centre,
-        // rotate so +Z points along facing. The arm model is authored along
-        // +Z, so an outward translation in this local frame slides it past
-        // the front face. Drawn unconditionally (even when extension = 0) so
-        // an idle User shows its arm tucked into the cauldron's rest slot.
-        poseStack.pushPose()
-        poseStack.translate(0.5, 0.5, 0.5)
-        rotateToFace(poseStack, state.facing)
-
-        val travel = ARM_REST_OFFSET + ARM_MAX_TRAVEL * state.extension
-        poseStack.pushPose()
-        poseStack.translate(-0.5, -0.5, travel.toDouble())
-        submitArmModel(poseStack, submitNodeCollector, armModel)
-        poseStack.popPose()
-
-        if (state.hasItem) {
-            // Item rests at the holder's grip point. ITEM_GRIP_LOCAL is the
-            // forward (along-arm) offset; ITEM_GRIP_DROP is the vertical
-            // offset (negative = lower) so the item nestles inside the
-            // holder's claw rather than floating above it.
-            poseStack.pushPose()
-            poseStack.translate(0.0, ITEM_GRIP_DROP.toDouble(), (travel + ITEM_GRIP_LOCAL).toDouble())
-            poseStack.scale(1.1f, 1.1f, 1.1f)
-            state.itemRS.submit(poseStack, submitNodeCollector, 0xF000F0, OverlayTexture.NO_OVERLAY, 0)
-            poseStack.popPose()
-        }
-
-        poseStack.popPose()
+        // Arm + held item temporarily disabled for an animation-less model
+        // test. The body model (chunk-rendered from blockstates/user.json)
+        // and the network-coloured emissive overlay above stay live; only
+        // the BER-driven extending arm and its held item are silenced.
+        // Re-enable alongside the matching extract block.
+        // val armModel = UserArmModel.get() ?: return
+        //
+        // poseStack.pushPose()
+        // poseStack.translate(0.5, 0.5, 0.5)
+        // rotateToFace(poseStack, state.facing)
+        //
+        // val travel = ARM_REST_OFFSET + ARM_MAX_TRAVEL * state.extension
+        // poseStack.pushPose()
+        // poseStack.translate(-0.5, -0.5, travel.toDouble())
+        // submitArmModel(poseStack, submitNodeCollector, armModel)
+        // poseStack.popPose()
+        //
+        // if (state.hasItem) {
+        //     poseStack.pushPose()
+        //     poseStack.translate(0.0, ITEM_GRIP_DROP.toDouble(), (travel + ITEM_GRIP_LOCAL).toDouble())
+        //     poseStack.scale(1.1f, 1.1f, 1.1f)
+        //     state.itemRS.submit(poseStack, submitNodeCollector, 0xF000F0, OverlayTexture.NO_OVERLAY, 0)
+        //     poseStack.popPose()
+        // }
+        //
+        // poseStack.popPose()
     }
 
     private fun submitArmModel(
@@ -295,6 +322,12 @@ open class UserRenderer(context: BlockEntityRendererProvider.Context) :
          *  chunk-rendered body. 1.001 = 1 px offset on a full-block face,
          *  invisible to the eye but enough for the depth test. */
         private const val EMISSIVE_OUTSET = 1.001f
+
+        /** Length of the interior network-laser stub in block units. 5 px
+         *  (= 5/16) runs the beam from block centre (pixel 8) to pixel 3
+         *  along the back-facing axis, sitting just shy of the back face
+         *  where the actual pipe connection lands. */
+        private const val INNER_LASER_HALF_LENGTH = 5f / 16f
 
         /** Local-Z offset of the arm's origin when fully retracted. The arm
          *  model is authored from Z=-1 to Z=9 px so a small negative offset

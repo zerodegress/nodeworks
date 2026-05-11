@@ -14,6 +14,7 @@ import damien.nodeworks.block.BroadcastAntennaBlock
 import damien.nodeworks.block.ExportChestBlock
 import damien.nodeworks.block.ImportChestBlock
 import damien.nodeworks.block.PlacerBlock
+import damien.nodeworks.block.ProcessingHandlerBlock
 import damien.nodeworks.block.UserBlock
 import damien.nodeworks.block.CraftingCoreBlock
 import damien.nodeworks.block.CoProcessorBlock
@@ -65,6 +66,19 @@ object ModBlocks {
             .requiresCorrectToolForDrops()
     )
 
+    val COVERED_PIPE: Block = register(
+        "covered_pipe",
+        { damien.nodeworks.block.CoveredPipeBlock(it) },
+        BlockBehaviour.Properties.of()
+            .strength(1.5f, 4.0f)
+            .requiresCorrectToolForDrops(),
+        // CoveredPipeBlockItem reads the CAMO_BLOCK_STATE data component on
+        // placement and adds a "Disguised as ..." tooltip; distinct-camo
+        // stacks stay separate so the player can keep multiple variants in
+        // hand without merging.
+        itemFactory = { block, props -> damien.nodeworks.item.CoveredPipeBlockItem(block, props) },
+    )
+
     val TERMINAL: Block = register(
         "terminal",
         ::TerminalBlock,
@@ -109,6 +123,13 @@ object ModBlocks {
             // Slime-block place/break/step sounds + slime-block bounce behavior wired in
             // VariableBlock's fallOn / updateEntityMovementAfterFallOn / stepOn overrides.
             .sound(net.minecraft.world.level.block.SoundType.SLIME_BLOCK)
+            // The slime_cube element on variable.json is ~60% opaque, which lands the
+            // model in `render_type: translucent`. Without [noOcclusion], the chunk
+            // mesher would treat the block as a full opaque cube and cull faces on
+            // adjacent blocks (you'd see holes through the translucent shell) AND
+            // would skip rendering the Variable's own back faces. Mirrors vanilla
+            // slime_block which is also non-occluding.
+            .noOcclusion()
     )
 
     val CRAFTING_CORE: Block = register(
@@ -302,6 +323,17 @@ object ModBlocks {
         BlockBehaviour.Properties.of()
             .strength(3.0f, 6.0f)
             .sound(net.minecraft.world.level.block.SoundType.COPPER)
+            .requiresCorrectToolForDrops()
+    )
+
+    /** Processing Handler. Block-based equivalent of `network:handle(...)`. The
+     *  back face joins the parent network so the CPU can find it; the front
+     *  face anchors a micro-network the player wires to feed machines. */
+    val PROCESSING_HANDLER: Block = register(
+        "processing_handler",
+        ::ProcessingHandlerBlock,
+        BlockBehaviour.Properties.of()
+            .strength(3.0f, 6.0f)
             .requiresCorrectToolForDrops()
     )
 
