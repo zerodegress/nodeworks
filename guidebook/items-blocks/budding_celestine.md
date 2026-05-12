@@ -9,6 +9,9 @@ description: grows celestine buds on its surface
 item_ids:
 - nodeworks:budding_celestine
 - nodeworks:celestine_cluster
+- nodeworks:large_celestine_bud
+- nodeworks:medium_celestine_bud
+- nodeworks:small_celestine_bud
 ---
 
 # Budding Celestine
@@ -28,6 +31,7 @@ and it will forever grow Celestine buds.
 <GameScene interactive={true} zoom="1" paddingTop="30" paddingLeft="60" paddingRight="60">
   <IsometricCamera yaw="210" pitch="10" />
   <ImportStructure src="../assets/assemblies/celestine_geode.snbt" />
+  <RemoveBlocks id="minecraft:stone" />
 </GameScene>
 
 Budding Celestine can be found in Celestine Geodes naturally around the world just

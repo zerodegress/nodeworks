@@ -7,19 +7,11 @@
             state: "minecraft:air"
         },
         {
-            pos: [1, 0, 1],
-            state: "minecraft:air"
-        },
-        {
             pos: [2, 0, 0],
             state: "minecraft:air"
         },
         {
             pos: [3, 0, 0],
-            state: "minecraft:air"
-        },
-        {
-            pos: [4, 0, 1],
             state: "minecraft:air"
         },
         {
@@ -37,7 +29,7 @@
         },
         {
             pos: [1, 0, 0],
-            state: "nodeworks:node",
+            state: "nodeworks:node{pipe_down:false,pipe_east:false,pipe_north:false,pipe_south:true,pipe_up:false,pipe_west:false}",
             nbt: {
                 components: {},
                 Items: [
@@ -47,12 +39,17 @@
                         id: "nodeworks:io_card"
                     }
                 ],
-                networkId: "1cef5c66-0c24-41ef-bf90-40bacd8d2979",
-                id: "nodeworks:node",
-                connections: [
-                    [I; 4, 0, 0],
-                    [I; 2, 0, 1]
-                ]
+                networkId: "a5cafb56-f7fd-491b-8dd3-2ef6977bfc83",
+                id: "nodeworks:node"
+            }
+        },
+        {
+            pos: [1, 0, 1],
+            state: "nodeworks:pipe{pipe_axis:junction,pipe_down:false,pipe_east:true,pipe_north:true,pipe_south:false,pipe_up:false,pipe_west:false}",
+            nbt: {
+                components: {},
+                networkId: "a5cafb56-f7fd-491b-8dd3-2ef6977bfc83",
+                id: "nodeworks:pipe"
             }
         },
         {
@@ -62,7 +59,7 @@
                 components: {},
                 autoRun: 0b,
                 layoutIndex: 0,
-                networkId: "1cef5c66-0c24-41ef-bf90-40bacd8d2979",
+                networkId: "a5cafb56-f7fd-491b-8dd3-2ef6977bfc83",
                 id: "nodeworks:terminal",
                 scripts: [
                     {
@@ -71,7 +68,7 @@
                     }
                 ],
                 connections: [
-                    [I; 1, 0, 0]
+                    [I; 2, 0, 1]
                 ]
             }
         },
@@ -81,21 +78,21 @@
             nbt: {
                 chunkLoadingEnabled: 0b,
                 components: {},
+                laserEnabled: 1b,
                 networkName: "",
                 handlerRetryLimit: 50,
-                networkId: "1cef5c66-0c24-41ef-bf90-40bacd8d2979",
+                networkId: "a5cafb56-f7fd-491b-8dd3-2ef6977bfc83",
                 nodeGlowStyle: 0,
                 id: "nodeworks:network_controller",
+                permanentId: "a5cafb56-f7fd-491b-8dd3-2ef6977bfc83",
+                laserMode: 0,
                 redstoneMode: 0,
-                connections: [
-                    [I; 4, 0, 0]
-                ],
-                networkColor: 5630138
+                networkColor: 3246044
             }
         },
         {
             pos: [4, 0, 0],
-            state: "nodeworks:node",
+            state: "nodeworks:node{pipe_down:false,pipe_east:false,pipe_north:false,pipe_south:true,pipe_up:false,pipe_west:false}",
             nbt: {
                 components: {},
                 Items: [
@@ -105,12 +102,17 @@
                         id: "nodeworks:io_card"
                     }
                 ],
-                networkId: "1cef5c66-0c24-41ef-bf90-40bacd8d2979",
-                id: "nodeworks:node",
-                connections: [
-                    [I; 3, 0, 1],
-                    [I; 1, 0, 0]
-                ]
+                networkId: "a5cafb56-f7fd-491b-8dd3-2ef6977bfc83",
+                id: "nodeworks:node"
+            }
+        },
+        {
+            pos: [4, 0, 1],
+            state: "nodeworks:pipe{pipe_axis:junction,pipe_down:false,pipe_east:false,pipe_north:true,pipe_south:false,pipe_up:false,pipe_west:true}",
+            nbt: {
+                components: {},
+                networkId: "a5cafb56-f7fd-491b-8dd3-2ef6977bfc83",
+                id: "nodeworks:pipe"
             }
         },
         {
@@ -126,9 +128,11 @@
     palette: [
         "minecraft:air",
         "minecraft:chest{facing:north,type:single,waterlogged:false}",
-        "nodeworks:node",
+        "nodeworks:node{pipe_down:false,pipe_east:false,pipe_north:false,pipe_south:true,pipe_up:false,pipe_west:false}",
+        "nodeworks:pipe{pipe_axis:junction,pipe_down:false,pipe_east:true,pipe_north:true,pipe_south:false,pipe_up:false,pipe_west:false}",
         "nodeworks:terminal{facing:north}",
         "nodeworks:network_controller",
+        "nodeworks:pipe{pipe_axis:junction,pipe_down:false,pipe_east:false,pipe_north:true,pipe_south:false,pipe_up:false,pipe_west:true}",
         "minecraft:shulker_box{facing:up}"
     ]
 }
