@@ -448,18 +448,41 @@ class InventoryTerminalMenu(
             if (!slot.hasItem()) return ItemStack.EMPTY
             // Snapshot pattern BEFORE onTake consumes ingredients
             if (autoPull) autoPullPattern = snapshotCraftPattern()
-            val result = slot.item.copy()
-            if (!playerInventory.add(result.copy())) return ItemStack.EMPTY
-            slot.onTake(player, result)
+            val firstResult = slot.item.copy()
+            // Server-side: loop crafts off the existing grid contents until
+            // the recipe stops matching (grid depleted, pattern broken by
+            // remaining items like buckets, etc.) or the player inventory
+            // can't accept more output. The 4096 safety bound covers a full
+            // 9-input × 64-per-stack grid even for recipes that yield a
+            // small count per craft. Client-side does a single iteration so
+            // vanilla's QUICK_MOVE while-loop sees the cleared slot and
+            // exits; the server's authoritative state syncs back.
+            if (serverLevel != null) {
+                var safety = 0
+                while (slot.hasItem() && safety < 4096) {
+                    safety++
+                    val nextResult = slot.item.copy()
+                    if (!playerInventory.add(nextResult.copy())) break
+                    slot.onTake(player, nextResult)
+                    // slot.onTake consumes one of each grid slot, triggering
+                    // slotsChanged which re-assembles the recipe and writes
+                    // the next result (or EMPTY if no match). Next iteration
+                    // observes the updated slot.
+                }
+            } else {
+                if (!playerInventory.add(firstResult.copy())) return ItemStack.EMPTY
+                slot.onTake(player, firstResult)
+            }
             // Clear the live result stack so vanilla's QUICK_MOVE loop
-            // terminates client-side after one iteration. Our [slotsChanged]
-            // is server-gated, so without this the client's prediction
-            // can't see the slot empty and re-enters quickMoveStack until
-            // it fills the player inventory with a phantom stack.
+            // terminates after this one (potentially batched) iteration.
+            // Our [slotsChanged] is server-gated for recipe re-assembly, so
+            // without this the client's prediction can't see the slot empty
+            // and re-enters quickMoveStack until it fills the player
+            // inventory with a phantom stack.
             slot.set(ItemStack.EMPTY)
             // Refill from network inline so the server's QUICK_MOVE loop
             // can chain crafts off the player's network stock instead of
-            // capping at one craft per click. The refill triggers
+            // capping at one batch per click. The refill triggers
             // [slotsChanged] which repopulates [resultContainer], the loop
             // then sees a fresh result and continues. Client-side this is
             // a no-op (server-only network access), so the prediction
@@ -467,7 +490,7 @@ class InventoryTerminalMenu(
             if (autoPull) {
                 autoPullRefill()
             }
-            return result
+            return firstResult
         }
         // Crafting input slots: move back to player inventory
         if (slotIndex in CRAFT_INPUT_START until CRAFT_OUTPUT_SLOT) {
@@ -535,18 +558,32 @@ class InventoryTerminalMenu(
     /**
      * Handle a click on the network item grid.
      * action: 0=extract full stack, 1=insert carried, 2=extract half, 3=shift-click to inventory
+     *
+     * [componentsPatch] is non-empty when the clicked cell carried a specific
+     * variant (e.g. Strength Potion). Used to narrow the extract so the same
+     * variant the player saw in the grid is what they get on the cursor.
      */
-    fun handleGridClick(player: Player, itemId: String, action: Int) {
+    fun handleGridClick(
+        player: Player,
+        itemId: String,
+        action: Int,
+        componentsPatch: net.minecraft.core.component.DataComponentPatch = net.minecraft.core.component.DataComponentPatch.EMPTY,
+    ) {
         val lvl = serverLevel ?: return
         val snap = snapshot ?: return
         val c = cache
+        val variantPatch = if (componentsPatch.size() > 0) componentsPatch else null
 
         when (action) {
             0, 2, 3 -> {
                 val identifier = net.minecraft.resources.Identifier.tryParse(itemId) ?: return
                 val item = net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(identifier) ?: return
 
-                val available = if (c != null) c.count(itemId) else {
+                val available = if (variantPatch != null) {
+                    NetworkStorageHelper.countVariantAcrossNetwork(lvl, snap, itemId, variantPatch)
+                } else if (c != null) {
+                    c.count(itemId)
+                } else {
                     NetworkStorageHelper.countItems(lvl, snap, itemId)
                 }
                 val maxStack = item.getDefaultMaxStackSize().toLong()
@@ -555,7 +592,7 @@ class InventoryTerminalMenu(
                     else -> minOf(available, maxStack)
                 }
 
-                val stacks = extractRealStacks(lvl, snap, c, itemId, toExtract)
+                val stacks = extractRealStacks(lvl, snap, c, itemId, toExtract, variantPatch)
                 if (stacks.isNotEmpty()) {
                     if (action == 3) {
                         // Shift-click into player inventory. Each component-distinct
@@ -614,13 +651,20 @@ class InventoryTerminalMenu(
                 // slot, but pulls from network storage instead of an inventory
                 // slot. Stack count is clamped to the item's default max stack
                 // size so dropping doesn't dump 64-stack-thousands at once.
+                //
+                // Threads [variantPatch] through count + extract so dropping
+                // from a component-bearing grid entry (e.g. Strength Potion)
+                // pulls that specific variant rather than any potion sharing
+                // the itemId.
                 val identifier = net.minecraft.resources.Identifier.tryParse(itemId) ?: return
                 val item = net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(identifier) ?: return
-                val available = if (c != null) c.count(itemId) else NetworkStorageHelper.countItems(lvl, snap, itemId)
+                val available = if (variantPatch != null) {
+                    NetworkStorageHelper.countVariantAcrossNetwork(lvl, snap, itemId, variantPatch)
+                } else if (c != null) c.count(itemId) else NetworkStorageHelper.countItems(lvl, snap, itemId)
                 val maxStack = item.getDefaultMaxStackSize().toLong()
                 val toDrop = if (action == 5) 1L else minOf(available, maxStack)
 
-                for (stack in extractRealStacks(lvl, snap, c, itemId, toDrop)) {
+                for (stack in extractRealStacks(lvl, snap, c, itemId, toDrop, variantPatch)) {
                     player.drop(stack, true)
                 }
             }
@@ -867,15 +911,28 @@ class InventoryTerminalMenu(
         recipeId: net.minecraft.resources.Identifier?,
         fallback: List<String>,
     ) {
+        // Clear the grid first: push into the network so the items return to
+        // storage instead of stuffing the player's inventory with a stack
+        // they didn't want back. Falls through to player inventory when the
+        // network is unreachable or refuses the stack, drops on the ground
+        // as a last resort.
+        val lvl = serverLevel
+        val snap = snapshot
         for (i in 0 until craftingContainer.containerSize) {
             val stack = craftingContainer.getItem(i)
+            if (stack.isEmpty) continue
+            if (lvl != null && snap != null) {
+                val inserted = NetworkStorageHelper.insertItemStack(lvl, snap, stack, cache)
+                if (inserted > 0) stack.shrink(inserted)
+            }
             if (!stack.isEmpty) {
                 if (!playerInventory.add(stack.copy())) {
                     player.drop(stack, false)
                 }
-                craftingContainer.setItem(i, ItemStack.EMPTY)
             }
+            craftingContainer.setItem(i, ItemStack.EMPTY)
         }
+        if (lvl != null && snap != null) needsImmediateSync = true
 
         val ingredients = resolveRecipeIngredients(recipeId)
         // Track claimed ingredients so a single `#planks` entry doesn't
@@ -958,19 +1015,40 @@ class InventoryTerminalMenu(
         c: NetworkInventoryCache?,
         itemId: String,
         maxCount: Long,
+        /** Optional variant patch. When non-null, only stacks whose components
+         *  hash equal the patch are extracted, so clicking a Strength Potion
+         *  cell doesn't accidentally pull a Fire Resistance one out of the
+         *  same itemId bucket. */
+        componentsPatch: net.minecraft.core.component.DataComponentPatch? = null,
     ): List<ItemStack> {
         if (maxCount <= 0L) return emptyList()
+        val wantHash = componentsPatch?.let { damien.nodeworks.script.BufferKey.componentsHash(it) }
         val out = ArrayList<ItemStack>()
         var remaining = maxCount
         for (card in NetworkStorageHelper.getStorageCards(snap)) {
             if (remaining <= 0L) break
             val storage = NetworkStorageHelper.getStorage(lvl, card) ?: continue
-            val stacks = damien.nodeworks.platform.PlatformServices.storage
-                .extractItemStacksMatching(storage, { it == itemId }, remaining)
+            // Use the stack-aware predicate when narrowing to a variant so
+            // the platform can filter at the slot level instead of returning
+            // all variants and forcing the caller to re-insert mismatches.
+            val stacks = if (wantHash != null) {
+                damien.nodeworks.platform.PlatformServices.storage.extractStacksByPredicate(
+                    storage,
+                    { stack ->
+                        val sid = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.item)?.toString()
+                        sid == itemId && damien.nodeworks.script.BufferKey.componentsHash(stack) == wantHash
+                    },
+                    remaining,
+                )
+            } else {
+                damien.nodeworks.platform.PlatformServices.storage.extractItemStacksMatching(
+                    storage, { it == itemId }, remaining,
+                )
+            }
             for (stack in stacks) {
                 if (stack.isEmpty) continue
                 val hasData = !stack.componentsPatch.isEmpty
-                c?.onExtracted(itemId, hasData, stack.count.toLong())
+                c?.onExtracted(itemId, hasData, stack.count.toLong(), stack.componentsPatch)
                 out.add(stack)
                 remaining -= stack.count
             }
@@ -1215,16 +1293,35 @@ class InventoryTerminalMenu(
      *   2. Items stay in CPU buffer throughout
      *   3. releaseCraftResult flushes buffer → network and releases CPU
      */
-    fun handleCraftRequest(player: Player, itemId: String, count: Int) {
+    fun handleCraftRequest(
+        player: Player,
+        itemId: String,
+        count: Int,
+        componentsPatch: net.minecraft.core.component.DataComponentPatch = net.minecraft.core.component.DataComponentPatch.EMPTY,
+    ) {
         val lvl = serverLevel ?: return
         val snap = snapshot ?: return
         if (count <= 0 || count > 999) return
 
-        val itemName = net.minecraft.resources.Identifier.tryParse(itemId)?.path?.replace('_', ' ') ?: itemId
+        // Display name prefers the variant's hover name (e.g. "Potion of Strength")
+        // when the request carries components, falling back to the identifier path.
+        val itemName = if (componentsPatch.size() > 0) {
+            val id = net.minecraft.resources.Identifier.tryParse(itemId)
+            val item = id?.let { net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(it) }
+            if (item != null) {
+                val stack = net.minecraft.world.item.ItemStack(item)
+                stack.applyComponents(componentsPatch)
+                stack.hoverName.string
+            } else {
+                itemId
+            }
+        } else {
+            net.minecraft.resources.Identifier.tryParse(itemId)?.path?.replace('_', ' ') ?: itemId
+        }
 
         // Create queue entry (pending until the whole job completes), scoped to the
         // network that owns this craft so other networks' terminals don't display it.
-        val entry = CraftQueueManager.addEntry(player.uuid, snap.networkId, itemId, itemName, count)
+        val entry = CraftQueueManager.addEntry(player.uuid, snap.networkId, itemId, itemName, count, componentsPatch)
 
         try {
             // CraftingHelper.craft does feasibility-aware CPU selection across every CPU on
@@ -1233,7 +1330,8 @@ class InventoryTerminalMenu(
             val result = damien.nodeworks.script.CraftingHelper.craft(
                 itemId, count, lvl, snap,
                 cache = cache,
-                submitterUuid = player.uuid
+                submitterUuid = player.uuid,
+                componentsPatch = componentsPatch,
             )
             val pending = damien.nodeworks.script.CraftingHelper.currentPendingJob
             damien.nodeworks.script.CraftingHelper.currentPendingJob = null
@@ -1605,7 +1703,8 @@ class InventoryTerminalMenu(
             damien.nodeworks.network.CraftQueueSyncPayload.QueueEntry(
                 id = e.id, itemId = e.itemId, name = e.itemName,
                 totalRequested = e.totalRequested, readyCount = readyCount,
-                availableCount = e.availableCount, isComplete = e.isComplete
+                availableCount = e.availableCount, isComplete = e.isComplete,
+                componentsPatch = e.componentsPatch,
             )
         }
         for (e in queue) e.dirty = false

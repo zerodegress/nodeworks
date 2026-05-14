@@ -691,20 +691,113 @@ class DiagnosticScreen(
 
     // ========== Craft Item Autocomplete ==========
 
-    private var craftAutocompleteSuggestions: List<String> = emptyList()
+    /** A single dropdown row. [canonical] is what gets typed into the field
+     *  on accept and sent to the server (either a bare itemId or the full
+     *  `id[components]` filter string). [stack] backs the icon + display name
+     *  rendering, so variant-bearing entries (Potion of Strength) show their
+     *  actual visual rather than the bare-item placeholder. */
+    private data class CraftCandidate(
+        val canonical: String,
+        val stack: net.minecraft.world.item.ItemStack,
+    ) {
+        val displayName: String get() = stack.hoverName.string
+    }
+
+    private var craftAutocompleteSuggestions: List<CraftCandidate> = emptyList()
     private var craftAutocompleteSelected = 0
     private var craftAutocompleteScroll = 0
     private val craftDropdownMaxVisible = 10
 
+    private var craftCandidatesCache: List<CraftCandidate>? = null
+    private var craftCandidatesCacheSize: Int = -1
+
+    /** Plain itemId entries from [craftableItems] combine with component-bearing
+     *  variant entries pulled from each local recipe's outputs. Deduped on the
+     *  canonical string so a recipe producing the same variant twice doesn't
+     *  double up in the popup. Memoized on [menu.processingApis.size] so the
+     *  list rebuilds as chunked Processing API payloads stream in after open. */
+    private val craftCandidates: List<CraftCandidate> get() {
+        val currentSize = menu.processingApis.size
+        val cached = craftCandidatesCache
+        if (cached != null && craftCandidatesCacheSize == currentSize) return cached
+        val built = buildCraftCandidates()
+        craftCandidatesCache = built
+        craftCandidatesCacheSize = currentSize
+        return built
+    }
+
+    private fun buildCraftCandidates(): List<CraftCandidate> {
+        // Split processing-api outputs into plain (no components patch) and
+        // variant buckets so we can decide whether a `craftableItems` entry
+        // for a given itemId represents a real plain recipe or just the
+        // itemId-only collapsed form of a variant-only recipe (e.g.
+        // `minecraft:potion` showing up as Uncraftable Potion when only
+        // strength / fire-resistance recipes exist).
+        val plainItemIdsFromApis = mutableSetOf<String>()
+        val variantItemIdsFromApis = mutableSetOf<String>()
+        for (api in menu.processingApis) {
+            for (ingr in api.outputs) {
+                if (ingr.stack.componentsPatch.size() > 0) variantItemIdsFromApis.add(ingr.itemId)
+                else plainItemIdsFromApis.add(ingr.itemId)
+            }
+        }
+
+        val out = LinkedHashMap<String, CraftCandidate>()
+        for (itemId in menu.topology.craftableItems) {
+            // Skip plain entries whose only recipes are variant-bearing.
+            // Instruction Set outputs go through this loop too, those itemIds
+            // never appear in `variantItemIdsFromApis` so they always pass.
+            if (itemId in variantItemIdsFromApis && itemId !in plainItemIdsFromApis) continue
+            val ident = net.minecraft.resources.Identifier.tryParse(itemId) ?: continue
+            val item = net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(ident) ?: continue
+            out.putIfAbsent(itemId, CraftCandidate(itemId, ItemStack(item)))
+        }
+        val registries = net.minecraft.client.Minecraft.getInstance().level?.registryAccess()
+        if (registries != null) {
+            for (api in menu.processingApis) {
+                for (ingr in api.outputs) {
+                    if (ingr.stack.componentsPatch.size() == 0) continue
+                    val canonical = damien.nodeworks.script.FilterRule.format(ingr.stack, registries)
+                    out.putIfAbsent(canonical, CraftCandidate(canonical, ingr.stack.copy()))
+                }
+            }
+        }
+        return out.values.toList()
+    }
+
     private fun updateCraftAutocomplete(query: String) {
-        val all = menu.topology.craftableItems
         craftAutocompleteSuggestions = if (query.isEmpty()) {
-            all // show all when empty
+            craftCandidates
         } else {
-            all.filter { it.contains(query, ignoreCase = true) }
+            val q = query.lowercase()
+            craftCandidates.filter {
+                it.canonical.lowercase().contains(q) || it.displayName.lowercase().contains(q)
+            }
         }
         craftAutocompleteSelected = 0
         craftAutocompleteScroll = 0
+    }
+
+    /** Parse [canonical] (a bare itemId or `id[components]`) and dispatch a
+     *  [CraftPreviewRequestPayload] carrying the variant's component patch.
+     *  Used by the keyboard / mouse accept paths so a typed entry like
+     *  `minecraft:potion[minecraft:potion_contents={potion:"minecraft:strength"}]`
+     *  previews the correct recipe instead of the first potion match. */
+    private fun sendCraftPreviewRequest(canonical: String) {
+        val registries = net.minecraft.client.Minecraft.getInstance().level?.registryAccess()
+        val (itemId, patch) = if (registries != null) {
+            val rule = damien.nodeworks.script.FilterRule.parse(canonical, registries)
+            if (rule is damien.nodeworks.script.FilterRule.Item) {
+                rule.itemId to (rule.componentsPatch ?: net.minecraft.core.component.DataComponentPatch.EMPTY)
+            } else {
+                canonical to net.minecraft.core.component.DataComponentPatch.EMPTY
+            }
+        } else {
+            canonical to net.minecraft.core.component.DataComponentPatch.EMPTY
+        }
+        damien.nodeworks.platform.PlatformServices.clientNetworking.sendToServer(
+            damien.nodeworks.network.CraftPreviewRequestPayload(menu.containerId, menu.clickedPos, itemId, patch)
+        )
     }
 
     private fun renderCraftAutocomplete(graphics: GuiGraphicsExtractor, mouseX: Int, mouseY: Int) {
@@ -728,7 +821,7 @@ class DiagnosticScreen(
         for (i in 0 until visibleCount) {
             val idx = craftAutocompleteScroll + i
             if (idx >= craftAutocompleteSuggestions.size) break
-            val suggestion = craftAutocompleteSuggestions[idx]
+            val candidate = craftAutocompleteSuggestions[idx]
             val sy = dropY + 1 + i * itemH
 
             val rowBg = when {
@@ -738,23 +831,17 @@ class DiagnosticScreen(
             }
             if (rowBg != 0) graphics.fill(dropX + 1, sy, dropX + dropW - 1, sy + itemH, rowBg)
 
-            // Item icon
-            val id = net.minecraft.resources.Identifier.tryParse(suggestion)
-            if (id != null) {
-                val item = net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(id)
-                if (item != null) {
-                    graphics.pose().pushMatrix()
-                    graphics.pose().translate((dropX + 2).toFloat(), (sy + 1).toFloat())
-                    graphics.pose().scale((0.5f).toFloat(), (0.5f).toFloat())
-                    graphics.renderItem(ItemStack(item), 0, 0)
-                    graphics.pose().popMatrix()
-                }
-            }
+            // Item icon (with components applied so potion variants show their
+            // actual swirl, dyed armor shows its tint, etc.)
+            graphics.pose().pushMatrix()
+            graphics.pose().translate((dropX + 2).toFloat(), (sy + 1).toFloat())
+            graphics.pose().scale(0.5f, 0.5f)
+            graphics.renderItem(candidate.stack, 0, 0)
+            graphics.pose().popMatrix()
 
-            // Item name (short) + ID
-            val shortName = suggestion.substringAfter(':').replace('_', ' ')
+            // Display name (variant-aware) instead of raw itemId chunk.
             val color = if (idx == craftAutocompleteSelected) WHITE else GRAY
-            graphics.drawString(font, shortName, dropX + 14, sy + 2, color, false)
+            graphics.drawString(font, candidate.displayName, dropX + 14, sy + 2, color, false)
         }
 
         // Scroll indicator
@@ -811,10 +898,14 @@ class DiagnosticScreen(
         if (itemId != null) {
             val item = net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(itemId)
             if (item != null) {
+                val nodeStack = ItemStack(item).apply {
+                    val patch = node.componentsPatch
+                    if (patch != null && patch.size() > 0) applyComponents(patch)
+                }
                 graphics.pose().pushMatrix()
                 graphics.pose().translate((x + indent).toFloat(), (y - 1).toFloat())
                 graphics.pose().scale((0.5f).toFloat(), (0.5f).toFloat())
-                graphics.renderItem(ItemStack(item), 0, 0)
+                graphics.renderItem(nodeStack, 0, 0)
                 graphics.pose().popMatrix()
             }
         }
@@ -934,7 +1025,11 @@ class DiagnosticScreen(
             if (itemId != null) {
                 val item = net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(itemId)
                 if (item != null) {
-                    graphics.renderItem(ItemStack(item), sx - 8, sy)
+                    val nodeStack = ItemStack(item).apply {
+                        val patch = n.componentsPatch
+                        if (patch != null && patch.size() > 0) applyComponents(patch)
+                    }
+                    graphics.renderItem(nodeStack, sx - 8, sy)
                     if (n.count > 1) {
                         graphics.drawString(font, "x${n.count}", sx + 9, sy + 9, WHITE, true)
                     }
@@ -1044,13 +1139,11 @@ class DiagnosticScreen(
                 if (term.handlers.isNotEmpty()) {
                     graphics.drawString(font, "Handlers:", contentLeft + 12, y, 0xFFAA83E0.toInt(), false)
                     y += lineH
-                    // Render each handler as a recipe icon strip, same visual language as
-                    // the Scripting Terminal's inline recipe hints. Legacy/plain names
-                    // fall back to gray text inside the helper.
                     val hintX = contentLeft + 18
                     val hintW = (splitX - 2) - hintX
                     y += damien.nodeworks.screen.widget.RecipeHintRenderer.renderHandlers(
-                        graphics, font, term.handlers, hintX, y, hintW
+                        graphics, font, term.handlers, hintX, y, hintW,
+                        resolver = { hash -> menu.processingApis.firstOrNull { it.name == hash } }
                     )
                     y += 2
                 }
@@ -1408,18 +1501,32 @@ class DiagnosticScreen(
                         // icon, wool swatch tinted to the item's channel, and
                         // the channel name. Pipe `|` separator because the item
                         // id itself contains a colon (e.g. minecraft:iron_ingot).
+                        // Trailing fields (recipe hash, side, index) point at the
+                        // ingredient's full component-bearing ItemStack in
+                        // processingApis so potion variants render their
+                        // specific potion instead of the Uncraftable Potion fallback.
                         val parts = row.text.removePrefix("__phitem:").split('|')
                         val itemId = parts.getOrNull(0).orEmpty()
                         val rgb = (parts.getOrNull(1)?.toIntOrNull() ?: 0xFFFFFF) and 0xFFFFFF
                         val name = parts.getOrNull(2).orEmpty()
+                        val recipeHash = parts.getOrNull(3).orEmpty()
+                        val isOutput = parts.getOrNull(4) == "1"
+                        val ingrIdx = parts.getOrNull(5)?.toIntOrNull() ?: -1
+                        val resolvedStack: ItemStack? = run {
+                            if (recipeHash.isEmpty() || ingrIdx < 0) return@run null
+                            val api = menu.processingApis.firstOrNull { it.name == recipeHash } ?: return@run null
+                            val list = if (isOutput) api.outputs else api.inputs
+                            list.getOrNull(ingrIdx)?.stack
+                        }
                         var x = textX + 6
                         val identifier = net.minecraft.resources.Identifier.tryParse(itemId)
                         val item = identifier?.let { net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(it) }
-                        if (item != null) {
+                        val displayStack = resolvedStack ?: item?.let { ItemStack(it) }
+                        if (displayStack != null) {
                             graphics.pose().pushMatrix()
                             graphics.pose().translate(x.toFloat(), (textY - 1).toFloat())
                             graphics.pose().scale(0.5f, 0.5f)
-                            graphics.renderItem(ItemStack(item), 0, 0)
+                            graphics.renderItem(displayStack, 0, 0)
                             graphics.pose().popMatrix()
                             x += 10
                         } else {
@@ -1479,9 +1586,10 @@ class DiagnosticScreen(
                     // minus the scrollbar gutter (6px track + 2px pad on each side).
                     val stripX = px + 6
                     val stripW = pw - 12
-                    damien.nodeworks.screen.widget.RecipeHintRenderer.render(
+                    damien.nodeworks.screen.widget.RecipeHintRenderer.renderById(
                         graphics, font, row.text, stripX, curY,
-                        stripW, damien.nodeworks.screen.widget.RecipeHintRenderer.HINT_HEIGHT
+                        stripW, damien.nodeworks.screen.widget.RecipeHintRenderer.HINT_HEIGHT,
+                        resolver = { hash -> menu.processingApis.firstOrNull { it.name == hash } }
                     )
                     curY += damien.nodeworks.screen.widget.RecipeHintRenderer.HINT_HEIGHT + 1
                     rowIndex++
@@ -1652,15 +1760,9 @@ class DiagnosticScreen(
 
                     257, 258 -> { // ENTER or TAB, accept and request preview
                         val selected = craftAutocompleteSuggestions[craftAutocompleteSelected]
-                        field.value = selected
+                        field.value = selected.canonical
                         craftAutocompleteSuggestions = emptyList()
-                        damien.nodeworks.platform.PlatformServices.clientNetworking.sendToServer(
-                            damien.nodeworks.network.CraftPreviewRequestPayload(
-                                menu.containerId,
-                                menu.clickedPos,
-                                selected
-                            )
-                        )
+                        sendCraftPreviewRequest(selected.canonical)
                         return true
                     }
                 }
@@ -1707,11 +1809,9 @@ class DiagnosticScreen(
                 val idx = craftAutocompleteScroll + visIdx
                 if (idx in craftAutocompleteSuggestions.indices) {
                     val selected = craftAutocompleteSuggestions[idx]
-                    field.value = selected
+                    field.value = selected.canonical
                     craftAutocompleteSuggestions = emptyList()
-                    damien.nodeworks.platform.PlatformServices.clientNetworking.sendToServer(
-                        damien.nodeworks.network.CraftPreviewRequestPayload(menu.containerId, menu.clickedPos, selected)
-                    )
+                    sendCraftPreviewRequest(selected.canonical)
                     return true
                 }
             }

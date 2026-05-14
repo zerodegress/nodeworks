@@ -1466,6 +1466,13 @@ class ScriptEngine(
         val item = net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(id)
             ?: return if (atomic) LuaValue.FALSE else LuaValue.valueOf(0)
         val maxStack = item.getDefaultMaxStackSize().toLong()
+        // Snapshot the buffer's variant template BEFORE the first extract so
+        // a drain-to-empty doesn't wipe the template under us. Rebuilt stacks
+        // for routing carry the variant's components (Potion of Strength,
+        // dyed armor) instead of being reconstructed as bare items.
+        val capturedTemplate = bufSrc.template.let { tmpl ->
+            if (tmpl.isEmpty) net.minecraft.world.item.ItemStack(item) else tmpl.copy()
+        }
 
         // Same per-network budget enforcement as [invokeItems]: clamp the
         // request, atomic short-circuits when budget can't fit the full count,
@@ -1492,14 +1499,33 @@ class ScriptEngine(
             var remaining = extracted
             while (remaining > 0L) {
                 val batch = minOf(remaining, maxStack).toInt()
-                val stack = net.minecraft.world.item.ItemStack(item, batch)
+                val stack = capturedTemplate.copyWithCount(batch)
                 val inserted = NetworkStorageHelper.insertItemStack(level, snapshot, stack, inventoryCache, channel).toLong()
                 totalInserted += inserted
                 remaining -= inserted
                 if (inserted == 0L) break
             }
             if (totalInserted < extracted) {
-                bufSrc.returnUnused(extracted - totalInserted)
+                // Partial commit. `atomic=false` must mean "nothing moved",
+                // so pull placed items back out and return all to the buffer.
+                if (totalInserted > 0L) {
+                    val itemId = net.minecraft.core.registries.BuiltInRegistries.ITEM
+                        .getKey(capturedTemplate.item).toString()
+                    val pulledBack = NetworkStorageHelper.extractVariantAcrossNetwork(
+                        level, snapshot, itemId, capturedTemplate.componentsPatch,
+                        totalInserted, channel,
+                    )
+                    val recovered = pulledBack.sumOf { it.count.toLong() }
+                    inventoryCache?.let { c ->
+                        if (recovered > 0L) c.onExtracted(
+                            itemId, !capturedTemplate.componentsPatch.isEmpty, recovered,
+                            capturedTemplate.componentsPatch,
+                        )
+                    }
+                    bufSrc.returnUnused(extracted - totalInserted + recovered)
+                } else {
+                    bufSrc.returnUnused(extracted)
+                }
                 return LuaValue.FALSE
             }
             budget.noteItemsMoved(tick, totalInserted)
@@ -1512,8 +1538,8 @@ class ScriptEngine(
             val batch = minOf(remaining, maxStack)
             val extracted = bufSrc.extract(batch)
             if (extracted == 0L) break
-            val stack = net.minecraft.world.item.ItemStack(item, extracted.toInt())
-            val inserted = NetworkStorageHelper.insertItemStack(level, snapshot, stack, inventoryCache).toLong()
+            val stack = capturedTemplate.copyWithCount(extracted.toInt())
+            val inserted = NetworkStorageHelper.insertItemStack(level, snapshot, stack, inventoryCache, channel).toLong()
             totalMoved += inserted
             if (inserted < extracted) {
                 bufSrc.returnUnused(extracted - inserted)
@@ -1831,8 +1857,19 @@ class ScriptEngine(
         // failures still log to the terminal so the player sees what went wrong.
         networkTable.setGuarded("Network", "craft", object : VarArgFunction() {
             override fun invoke(args: Varargs): Varargs {
-                val identifier = args.checkjstring(2)
+                val rawIdentifier = args.checkjstring(2)
                 val count = if (args.narg() >= 3 && !args.arg(3).isnil()) args.checkint(3) else 1
+
+                // Parse so `network:craft("minecraft:potion[minecraft:potion_contents={...}]")`
+                // resolves to (itemId, componentsPatch) and the planner can target
+                // the specific variant. Plain ids pass through unchanged.
+                val registries = level.registryAccess()
+                val parsedRule = FilterRule.parse(rawIdentifier, registries)
+                val (identifier, requestedPatch) = when (parsedRule) {
+                    is FilterRule.Item -> parsedRule.itemId to (parsedRule.componentsPatch
+                        ?: net.minecraft.core.component.DataComponentPatch.EMPTY)
+                    else -> rawIdentifier to net.minecraft.core.component.DataComponentPatch.EMPTY
+                }
 
                 CraftingHelper.currentPendingJob = null
                 // omitDeliver = true: the CPU plan stops at the root output, leaving
@@ -1846,6 +1883,7 @@ class ScriptEngine(
                     callerScheduler = scheduler,
                     traceLog = { msg -> logCallback(msg, false) },
                     omitDeliver = true,
+                    componentsPatch = requestedPatch,
                 )
 
                 // Check for async pending job (processing handler or async assembly)
@@ -1901,7 +1939,7 @@ class ScriptEngine(
                             filter = cr.outputItemId,
                             sourceStorage = { null },
                             level = level,
-                            bufferSource = damien.nodeworks.script.BufferSource(cpu, cr.outputItemId, cr.count.toLong()),
+                            bufferSource = damien.nodeworks.script.BufferSource.ofItemId(cpu, cr.outputItemId, cr.count.toLong()),
                         )
                     )
                 }
@@ -2132,8 +2170,8 @@ class ScriptEngine(
                     val remote = if (api.remoteTerminalPositions != null) " (remote)" else ""
                     sb.appendLine("  ${api.pos}$remote: ${api.apis.size} cards")
                     for (card in api.apis) {
-                        val inputs = card.inputs.joinToString(", ") { "${it.first} x${it.second}" }
-                        val outputs = card.outputs.joinToString(", ") { "${it.first} x${it.second}" }
+                        val inputs = card.inputs.joinToString(", ") { "${it.itemId} x${it.count}" }
+                        val outputs = card.outputs.joinToString(", ") { "${it.itemId} x${it.count}" }
                         sb.appendLine("    [${card.name}] $inputs -> $outputs")
                     }
                 }

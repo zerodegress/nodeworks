@@ -45,14 +45,31 @@ sealed class Operation {
     var outputNodeId: Int = -1
 
     /** Extract [amount] of [itemId] from network storage into the CPU buffer.
-     *  Atomic reservation on the network happens immediately, scheduler gates consumption. */
+     *  Atomic reservation on the network happens immediately, scheduler gates
+     *  consumption.
+     *
+     *  [componentsPatch] narrows the extraction to a specific variant when
+     *  non-null; null matches any variant (the plain-item path).
+     *
+     *  [componentsHash] is derived from the patch each session, never stored.
+     *  Persisting the hash directly would drift across reloads (it depends on
+     *  Holder.Reference identity), so [saveToNBT] / [loadFromNBT] round-trip
+     *  the patch itself via [DataComponentPatch.CODEC] under registry ops. */
     data class Pull(
         override val id: Int,
         override val dependsOn: List<Int>,
         val itemId: String,
-        val amount: Long
+        val amount: Long,
+        val componentsPatch: net.minecraft.core.component.DataComponentPatch? = null,
     ) : Operation() {
         override val baseCost: Int get() = CpuRules.PULL_BASE_COST
+
+        /** In-session variant hash derived from [componentsPatch]. */
+        val componentsHash: String
+            get() = componentsPatch
+                ?.takeIf { it.size() > 0 }
+                ?.let { damien.nodeworks.script.BufferKey.componentsHash(it) }
+                ?: ""
     }
 
     /**
@@ -103,7 +120,7 @@ sealed class Operation {
     // Serialization
     // =====================================================================
 
-    fun saveToNBT(tag: CompoundTag) {
+    fun saveToNBT(tag: CompoundTag, registries: net.minecraft.core.HolderLookup.Provider) {
         tag.putInt("id", id)
         tag.putLong("readyAt", readyAt)
         tag.putBoolean("inProgress", inProgress)
@@ -115,6 +132,16 @@ sealed class Operation {
                 tag.putString("kind", "pull")
                 tag.putString("itemId", itemId)
                 tag.putLong("amount", amount)
+                // Persist the patch (registry-id encoded), not the hash.
+                val patch = componentsPatch
+                if (patch != null && patch.size() > 0) {
+                    val ops = net.minecraft.resources.RegistryOps.create(
+                        net.minecraft.nbt.NbtOps.INSTANCE, registries,
+                    )
+                    net.minecraft.core.component.DataComponentPatch.CODEC
+                        .encodeStart(ops, patch).result().orElse(null)
+                        ?.let { tag.put("componentsPatch", it) }
+                }
             }
             is Process -> {
                 tag.putString("kind", "process")
@@ -144,14 +171,33 @@ sealed class Operation {
         // 26.1: CompoundTag.getInt/getLong/getString/getBoolean/getIntArray/getList now
         //  return Optional<T>, *Or(name, default) accessors cover the "read with default"
         //  case. Reads still rely on the prior keys, so pre-migration NBT loads cleanly.
-        fun loadFromNBT(tag: CompoundTag): Operation? {
+        fun loadFromNBT(tag: CompoundTag, registries: net.minecraft.core.HolderLookup.Provider): Operation? {
             val id = tag.getIntOr("id", -1)
             if (id < 0) return null
             val readyAt = tag.getLongOr("readyAt", -1L)
             val inProgress = tag.getBooleanOr("inProgress", false)
             val deps = tag.getIntArray("deps").orElse(IntArray(0)).toList()
             val op: Operation = when (tag.getStringOr("kind", "")) {
-                "pull" -> Pull(id, deps, tag.getStringOr("itemId", ""), tag.getLongOr("amount", 0L))
+                "pull" -> {
+                    // New saves carry the encoded patch. Legacy saves with
+                    // only the old "componentsHash" string can't round-trip
+                    // (the hash is session-unstable), so a legacy
+                    // component-bearing Pull resumes as a plain pull.
+                    val patchTag = tag.getCompound("componentsPatch").orElse(null)
+                    val patch = if (patchTag != null) {
+                        val ops = net.minecraft.resources.RegistryOps.create(
+                            net.minecraft.nbt.NbtOps.INSTANCE, registries,
+                        )
+                        net.minecraft.core.component.DataComponentPatch.CODEC
+                            .parse(ops, patchTag).result().orElse(null)
+                    } else null
+                    Pull(
+                        id, deps,
+                        tag.getStringOr("itemId", ""),
+                        tag.getLongOr("amount", 0L),
+                        patch,
+                    )
+                }
                 "process" -> Process(
                     id, deps, tag.getStringOr("api", ""),
                     readItemList(tag, "inputs"),

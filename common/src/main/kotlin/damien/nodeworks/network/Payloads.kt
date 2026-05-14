@@ -11,6 +11,39 @@ import net.minecraft.resources.Identifier
  * These are platform-agnostic data classes, registration and handling is in the platform module.
  */
 
+/** Defensive cap on the encoded byte size of a single client-supplied
+ *  [net.minecraft.core.component.DataComponentPatch]. A patch is always the
+ *  tail field of its payload, so a remaining-byte check at the gate fences
+ *  off DoS via multi-MB `custom_data` blobs without rewriting the codec.
+ *  16 KiB comfortably accommodates every legitimate variant (potions, dyed
+ *  armor, enchanted books with reasonable enchantment lists, signs with
+ *  text); anything larger is rejected and the connection drops. */
+private const val MAX_CLIENT_PATCH_BYTES = 16 * 1024
+
+private fun readBoundedPatch(buf: net.minecraft.network.RegistryFriendlyByteBuf): net.minecraft.core.component.DataComponentPatch {
+    if (buf.readableBytes() > MAX_CLIENT_PATCH_BYTES) {
+        throw io.netty.handler.codec.DecoderException(
+            "Component patch exceeds $MAX_CLIENT_PATCH_BYTES byte cap"
+        )
+    }
+    return net.minecraft.core.component.DataComponentPatch.STREAM_CODEC.decode(buf)
+}
+
+/** Mirror of [readBoundedPatch] for payloads whose tail is a full
+ *  client-supplied [net.minecraft.world.item.ItemStack] (which encodes its
+ *  own [net.minecraft.core.component.DataComponentPatch] inline via
+ *  `OPTIONAL_STREAM_CODEC`). Without this, a modified client can attach a
+ *  multi-MB `custom_data` blob to e.g. a Processing Set slot drop and force
+ *  expensive decode/storage work on the server. */
+private fun readBoundedStack(buf: net.minecraft.network.RegistryFriendlyByteBuf): net.minecraft.world.item.ItemStack {
+    if (buf.readableBytes() > MAX_CLIENT_PATCH_BYTES) {
+        throw io.netty.handler.codec.DecoderException(
+            "ItemStack payload exceeds $MAX_CLIENT_PATCH_BYTES byte cap"
+        )
+    }
+    return net.minecraft.world.item.ItemStack.OPTIONAL_STREAM_CODEC.decode(buf)
+}
+
 data class RunScriptPayload(val terminalPos: BlockPos) : CustomPacketPayload {
     companion object {
         val TYPE: CustomPacketPayload.Type<RunScriptPayload> = CustomPacketPayload.Type(Identifier.fromNamespaceAndPath("nodeworks", "run_script"))
@@ -126,17 +159,41 @@ data class SetInstructionGridPayload(val containerId: Int, val items: List<Strin
  *         4 = right-click insert one, 5 = drop one (Q), 6 = drop stack (Ctrl+Q)
  * kind: 0 = item (default), 1 = fluid, fluid clicks route to bucket-fill logic server-side.
  */
-data class InvTerminalClickPayload(val containerId: Int, val itemId: String, val action: Int, val kind: Byte = 0) : CustomPacketPayload {
+data class InvTerminalClickPayload(
+    val containerId: Int,
+    val itemId: String,
+    val action: Int,
+    val kind: Byte = 0,
+    /** Components patch of the clicked grid cell. Lets a click on a Strength
+     *  Potion extract that specific variant instead of whichever potion the
+     *  server's itemId-only lookup happens to find first. Empty for cells
+     *  without component data. */
+    val componentsPatch: net.minecraft.core.component.DataComponentPatch = net.minecraft.core.component.DataComponentPatch.EMPTY,
+) : CustomPacketPayload {
     companion object {
         val TYPE: CustomPacketPayload.Type<InvTerminalClickPayload> = CustomPacketPayload.Type(Identifier.fromNamespaceAndPath("nodeworks", "inv_terminal_click"))
         val CODEC: StreamCodec<FriendlyByteBuf, InvTerminalClickPayload> = CustomPacketPayload.codec(
             { p, buf ->
+                val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
                 buf.writeVarInt(p.containerId)
                 buf.writeUtf(p.itemId, 256)
                 buf.writeVarInt(p.action)
                 buf.writeByte(p.kind.toInt())
+                val hasPatch = p.componentsPatch.size() > 0
+                buf.writeBoolean(hasPatch)
+                if (hasPatch) net.minecraft.core.component.DataComponentPatch.STREAM_CODEC.encode(regBuf, p.componentsPatch)
             },
-            { buf -> InvTerminalClickPayload(buf.readVarInt(), buf.readUtf(256), buf.readVarInt(), buf.readByte()) }
+            { buf ->
+                val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
+                val cid = buf.readVarInt()
+                val id = buf.readUtf(256)
+                val act = buf.readVarInt()
+                val k = buf.readByte()
+                val hasPatch = buf.readBoolean()
+                val patch = if (hasPatch) readBoundedPatch(regBuf)
+                    else net.minecraft.core.component.DataComponentPatch.EMPTY
+                InvTerminalClickPayload(cid, id, act, k, patch)
+            }
         )
     }
     override fun type() = TYPE
@@ -216,12 +273,36 @@ data class InvTerminalDistributePayload(val containerId: Int, val slotType: Int,
  * C2S: Request automated network crafting (Alt+click).
  * Server allocates a CraftingCore and initiates crafting via CraftingHelper.
  */
-data class InvTerminalCraftPayload(val containerId: Int, val itemId: String, val count: Int) : CustomPacketPayload {
+data class InvTerminalCraftPayload(
+    val containerId: Int,
+    val itemId: String,
+    val count: Int,
+    /** Component patch of the requested variant. Empty for plain crafts.
+     *  Threaded through to the planner so variant-specific Pull ops can
+     *  filter storage, and to the queue-row renderer so a Potion of
+     *  Strength job displays as the correct potion. */
+    val componentsPatch: net.minecraft.core.component.DataComponentPatch = net.minecraft.core.component.DataComponentPatch.EMPTY,
+) : CustomPacketPayload {
     companion object {
         val TYPE: CustomPacketPayload.Type<InvTerminalCraftPayload> = CustomPacketPayload.Type(Identifier.fromNamespaceAndPath("nodeworks", "inv_terminal_craft"))
         val CODEC: StreamCodec<FriendlyByteBuf, InvTerminalCraftPayload> = CustomPacketPayload.codec(
-            { p, buf -> buf.writeVarInt(p.containerId); buf.writeUtf(p.itemId, 256); buf.writeVarInt(p.count) },
-            { buf -> InvTerminalCraftPayload(buf.readVarInt(), buf.readUtf(256), buf.readVarInt()) }
+            { p, buf ->
+                val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
+                buf.writeVarInt(p.containerId); buf.writeUtf(p.itemId, 256); buf.writeVarInt(p.count)
+                val hasPatch = p.componentsPatch.size() > 0
+                buf.writeBoolean(hasPatch)
+                if (hasPatch) net.minecraft.core.component.DataComponentPatch.STREAM_CODEC.encode(regBuf, p.componentsPatch)
+            },
+            { buf ->
+                val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
+                val cid = buf.readVarInt()
+                val id = buf.readUtf(256)
+                val ct = buf.readVarInt()
+                val hasPatch = buf.readBoolean()
+                val patch = if (hasPatch) readBoundedPatch(regBuf)
+                    else net.minecraft.core.component.DataComponentPatch.EMPTY
+                InvTerminalCraftPayload(cid, id, ct, patch)
+            }
         )
     }
     override fun type() = TYPE
@@ -344,12 +425,30 @@ data class SetProcessingApiNamePayload(val containerId: Int, val name: String) :
  * C2S: Set a single ghost slot on the Processing Set by item ID.
  * slotIndex 0-8 = input, 9-11 = output. Empty string = clear slot.
  */
-data class SetProcessingApiSlotPayload(val containerId: Int, val slotIndex: Int, val itemId: String) : CustomPacketPayload {
+/**
+ * C2S: Set a Processing Set editor ghost slot to [stack].
+ *  [ItemStack.EMPTY] clears the slot. Carries the full stack (with
+ *  DataComponents) so component-bearing items (potions, dyed armor,
+ *  enchanted books) round-trip correctly from JEI drag / recipe transfer
+ *  into the ghost slot. slotIndex 0-8 = input, 9-11 = output.
+ */
+data class SetProcessingApiSlotPayload(val containerId: Int, val slotIndex: Int, val stack: net.minecraft.world.item.ItemStack) : CustomPacketPayload {
     companion object {
         val TYPE: CustomPacketPayload.Type<SetProcessingApiSlotPayload> = CustomPacketPayload.Type(Identifier.fromNamespaceAndPath("nodeworks", "set_processing_api_slot"))
         val CODEC: StreamCodec<FriendlyByteBuf, SetProcessingApiSlotPayload> = CustomPacketPayload.codec(
-            { p, buf -> buf.writeVarInt(p.containerId); buf.writeVarInt(p.slotIndex); buf.writeUtf(p.itemId, 256) },
-            { buf -> SetProcessingApiSlotPayload(buf.readVarInt(), buf.readVarInt(), buf.readUtf(256)) }
+            { p, buf ->
+                val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
+                buf.writeVarInt(p.containerId)
+                buf.writeVarInt(p.slotIndex)
+                net.minecraft.world.item.ItemStack.OPTIONAL_STREAM_CODEC.encode(regBuf, p.stack)
+            },
+            { buf ->
+                val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
+                val cid = buf.readVarInt()
+                val slot = buf.readVarInt()
+                val stack = readBoundedStack(regBuf)
+                SetProcessingApiSlotPayload(cid, slot, stack)
+            }
         )
     }
     override fun type() = TYPE
@@ -374,22 +473,35 @@ data class CpuFailurePayload(val containerId: Int, val reason: String) : CustomP
     override fun type() = TYPE
 }
 
-data class BufferSyncPayload(val containerId: Int, val entries: List<Pair<String, Long>>) : CustomPacketPayload {
+/** S2C: per-bucket buffer contents for the Crafting CPU GUI. Carries a
+ *  representative [ItemStack] (with components) plus the Long bucket count
+ *  so variant-bearing buckets (Potion of Strength, dyed armor, enchanted
+ *  books) render their actual visual in the buffer grid + tooltip. */
+data class BufferSyncPayload(
+    val containerId: Int,
+    val entries: List<Pair<net.minecraft.world.item.ItemStack, Long>>,
+) : CustomPacketPayload {
     companion object {
         val TYPE: CustomPacketPayload.Type<BufferSyncPayload> = CustomPacketPayload.Type(Identifier.fromNamespaceAndPath("nodeworks", "buffer_sync"))
         val CODEC: StreamCodec<FriendlyByteBuf, BufferSyncPayload> = CustomPacketPayload.codec(
             { p, buf ->
+                val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
                 buf.writeVarInt(p.containerId)
                 buf.writeVarInt(p.entries.size)
-                for ((id, count) in p.entries) {
-                    buf.writeUtf(id, 256)
+                for ((stack, count) in p.entries) {
+                    net.minecraft.world.item.ItemStack.OPTIONAL_STREAM_CODEC.encode(regBuf, stack)
                     buf.writeVarLong(count)
                 }
             },
             { buf ->
+                val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
                 val containerId = buf.readVarInt()
                 val size = buf.readVarInt()
-                val entries = (0 until size).map { buf.readUtf(256) to buf.readVarLong() }
+                val entries = (0 until size).map {
+                    val stack = net.minecraft.world.item.ItemStack.OPTIONAL_STREAM_CODEC.decode(regBuf)
+                    val count = buf.readVarLong()
+                    stack to count
+                }
                 BufferSyncPayload(containerId, entries)
             }
         )
@@ -456,12 +568,35 @@ data class DismissCpuFailurePayload(val pos: BlockPos) : CustomPacketPayload {
 }
 
 /** C2S: Request a craft preview tree for the diagnostic tool. */
-data class CraftPreviewRequestPayload(val containerId: Int, val networkPos: BlockPos, val itemId: String) : CustomPacketPayload {
+data class CraftPreviewRequestPayload(
+    val containerId: Int,
+    val networkPos: BlockPos,
+    val itemId: String,
+    /** Component patch of the requested variant. Empty for plain crafts.
+     *  Lets the diagnostic preview a Strength Potion specifically rather than
+     *  whichever potion recipe the network's first-match picks. */
+    val componentsPatch: net.minecraft.core.component.DataComponentPatch = net.minecraft.core.component.DataComponentPatch.EMPTY,
+) : CustomPacketPayload {
     companion object {
         val TYPE: CustomPacketPayload.Type<CraftPreviewRequestPayload> = CustomPacketPayload.Type(Identifier.fromNamespaceAndPath("nodeworks", "craft_preview_request"))
         val CODEC: StreamCodec<FriendlyByteBuf, CraftPreviewRequestPayload> = CustomPacketPayload.codec(
-            { p, buf -> buf.writeVarInt(p.containerId); buf.writeBlockPos(p.networkPos); buf.writeUtf(p.itemId, 256) },
-            { buf -> CraftPreviewRequestPayload(buf.readVarInt(), buf.readBlockPos(), buf.readUtf(256)) }
+            { p, buf ->
+                val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
+                buf.writeVarInt(p.containerId); buf.writeBlockPos(p.networkPos); buf.writeUtf(p.itemId, 256)
+                val hasPatch = p.componentsPatch.size() > 0
+                buf.writeBoolean(hasPatch)
+                if (hasPatch) net.minecraft.core.component.DataComponentPatch.STREAM_CODEC.encode(regBuf, p.componentsPatch)
+            },
+            { buf ->
+                val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
+                val cid = buf.readVarInt()
+                val pos = buf.readBlockPos()
+                val id = buf.readUtf(256)
+                val hasPatch = buf.readBoolean()
+                val patch = if (hasPatch) readBoundedPatch(regBuf)
+                    else net.minecraft.core.component.DataComponentPatch.EMPTY
+                CraftPreviewRequestPayload(cid, pos, id, patch)
+            }
         )
     }
     override fun type() = TYPE
@@ -486,6 +621,7 @@ data class CraftPreviewResponsePayload(val containerId: Int, val tree: damien.no
         )
 
         private fun writeNode(buf: FriendlyByteBuf, node: damien.nodeworks.script.CraftTreeBuilder.CraftTreeNode) {
+            val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
             buf.writeUtf(node.itemId, 256)
             buf.writeUtf(node.itemName, 128)
             buf.writeVarInt(node.count)
@@ -494,11 +630,16 @@ data class CraftPreviewResponsePayload(val containerId: Int, val tree: damien.no
             buf.writeUtf(node.resolvedBy, 32)
             buf.writeVarInt(node.inStorage)
             buf.writeVarInt(node.nodeId)
+            val patch = node.componentsPatch
+            val hasPatch = patch != null && patch.size() > 0
+            buf.writeBoolean(hasPatch)
+            if (hasPatch && patch != null) net.minecraft.core.component.DataComponentPatch.STREAM_CODEC.encode(regBuf, patch)
             buf.writeVarInt(node.children.size)
             for (child in node.children) writeNode(buf, child)
         }
 
         private fun readNode(buf: FriendlyByteBuf): damien.nodeworks.script.CraftTreeBuilder.CraftTreeNode {
+            val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
             val itemId = buf.readUtf(256)
             val itemName = buf.readUtf(128)
             val count = buf.readVarInt()
@@ -507,9 +648,15 @@ data class CraftPreviewResponsePayload(val containerId: Int, val tree: damien.no
             val resolvedBy = buf.readUtf(32)
             val inStorage = buf.readVarInt()
             val nodeId = buf.readVarInt()
+            val hasPatch = buf.readBoolean()
+            val patch = if (hasPatch) net.minecraft.core.component.DataComponentPatch.STREAM_CODEC.decode(regBuf)
+                else net.minecraft.core.component.DataComponentPatch.EMPTY
             val childCount = buf.readVarInt()
             val children = (0 until childCount).map { readNode(buf) }
-            val n = damien.nodeworks.script.CraftTreeBuilder.CraftTreeNode(itemId, itemName, count, source, templateName, resolvedBy, inStorage, children)
+            val n = damien.nodeworks.script.CraftTreeBuilder.CraftTreeNode(
+                itemId, itemName, count, source, templateName, resolvedBy, inStorage, children,
+                componentsPatch = patch,
+            )
             n.nodeId = nodeId
             return n
         }
@@ -551,6 +698,7 @@ data class CraftingCpuTreePayload(
         )
 
         private fun writeNode(buf: FriendlyByteBuf, node: damien.nodeworks.script.CraftTreeBuilder.CraftTreeNode) {
+            val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
             buf.writeUtf(node.itemId, 256)
             buf.writeUtf(node.itemName, 128)
             buf.writeVarInt(node.count)
@@ -559,11 +707,16 @@ data class CraftingCpuTreePayload(
             buf.writeUtf(node.resolvedBy, 32)
             buf.writeVarInt(node.inStorage)
             buf.writeVarInt(node.nodeId)
+            val patch = node.componentsPatch
+            val hasPatch = patch != null && patch.size() > 0
+            buf.writeBoolean(hasPatch)
+            if (hasPatch && patch != null) net.minecraft.core.component.DataComponentPatch.STREAM_CODEC.encode(regBuf, patch)
             buf.writeVarInt(node.children.size)
             for (child in node.children) writeNode(buf, child)
         }
 
         private fun readNode(buf: FriendlyByteBuf): damien.nodeworks.script.CraftTreeBuilder.CraftTreeNode {
+            val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
             val itemId = buf.readUtf(256)
             val itemName = buf.readUtf(128)
             val count = buf.readVarInt()
@@ -572,10 +725,14 @@ data class CraftingCpuTreePayload(
             val resolvedBy = buf.readUtf(32)
             val inStorage = buf.readVarInt()
             val nodeId = buf.readVarInt()
+            val hasPatch = buf.readBoolean()
+            val patch = if (hasPatch) net.minecraft.core.component.DataComponentPatch.STREAM_CODEC.decode(regBuf)
+                else net.minecraft.core.component.DataComponentPatch.EMPTY
             val childCount = buf.readVarInt()
             val children = (0 until childCount).map { readNode(buf) }
             val node = damien.nodeworks.script.CraftTreeBuilder.CraftTreeNode(
-                itemId, itemName, count, source, templateName, resolvedBy, inStorage, children
+                itemId, itemName, count, source, templateName, resolvedBy, inStorage, children,
+                componentsPatch = patch,
             )
             node.nodeId = nodeId
             return node
@@ -588,6 +745,10 @@ data class CraftingCpuTreePayload(
  * S2C: Sync craft queue entries to the client for the reserved row.
  */
 data class CraftQueueSyncPayload(val containerId: Int, val entries: List<QueueEntry>) : CustomPacketPayload {
+    /** One craft-queue row. [componentsPatch] preserves the variant the player
+     *  requested (potion type, dye color, enchantment) so the queue slot
+     *  renders the right icon instead of a bare uncraftable placeholder.
+     *  Empty patch = plain item (the common case). */
     data class QueueEntry(
         val id: Int,
         val itemId: String,
@@ -595,12 +756,14 @@ data class CraftQueueSyncPayload(val containerId: Int, val entries: List<QueueEn
         val totalRequested: Int,
         val readyCount: Int,
         val availableCount: Int,
-        val isComplete: Boolean
+        val isComplete: Boolean,
+        val componentsPatch: net.minecraft.core.component.DataComponentPatch = net.minecraft.core.component.DataComponentPatch.EMPTY,
     )
     companion object {
         val TYPE: CustomPacketPayload.Type<CraftQueueSyncPayload> = CustomPacketPayload.Type(Identifier.fromNamespaceAndPath("nodeworks", "craft_queue_sync"))
         val CODEC: StreamCodec<FriendlyByteBuf, CraftQueueSyncPayload> = CustomPacketPayload.codec(
             { p, buf ->
+                val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
                 buf.writeVarInt(p.containerId)
                 buf.writeVarInt(p.entries.size)
                 for (e in p.entries) {
@@ -611,16 +774,29 @@ data class CraftQueueSyncPayload(val containerId: Int, val entries: List<QueueEn
                     buf.writeVarInt(e.readyCount)
                     buf.writeVarInt(e.availableCount)
                     buf.writeBoolean(e.isComplete)
+                    val hasPatch = e.componentsPatch.size() > 0
+                    buf.writeBoolean(hasPatch)
+                    if (hasPatch) {
+                        net.minecraft.core.component.DataComponentPatch.STREAM_CODEC.encode(regBuf, e.componentsPatch)
+                    }
                 }
             },
             { buf ->
+                val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
                 val containerId = buf.readVarInt()
                 val size = buf.readVarInt()
                 val entries = (0 until size).map {
-                    QueueEntry(
-                        buf.readVarInt(), buf.readUtf(256), buf.readUtf(256),
-                        buf.readVarInt(), buf.readVarInt(), buf.readVarInt(), buf.readBoolean()
-                    )
+                    val id = buf.readVarInt()
+                    val itemId = buf.readUtf(256)
+                    val name = buf.readUtf(256)
+                    val total = buf.readVarInt()
+                    val ready = buf.readVarInt()
+                    val avail = buf.readVarInt()
+                    val done = buf.readBoolean()
+                    val hasPatch = buf.readBoolean()
+                    val patch = if (hasPatch) net.minecraft.core.component.DataComponentPatch.STREAM_CODEC.decode(regBuf)
+                        else net.minecraft.core.component.DataComponentPatch.EMPTY
+                    QueueEntry(id, itemId, name, total, ready, avail, done, patch)
                 }
                 CraftQueueSyncPayload(containerId, entries)
             }
@@ -851,10 +1027,13 @@ data class ProcessingHandlerUnbindPayload(val pos: BlockPos) : CustomPacketPaylo
     override fun type() = TYPE
 }
 
-/** C2S: change the channel for a single input itemId. */
+/** C2S: change the channel for a single input variant. Identity is
+ *  (itemId, componentsHash) so the same recipe can address each variant
+ *  of a same-itemId pair independently (e.g. Strength vs Fire Resistance). */
 data class ProcessingHandlerSetInputChannelPayload(
     val pos: BlockPos,
     val itemId: String,
+    val componentsHash: String,
     val channelId: Int,
 ) : CustomPacketPayload {
     companion object {
@@ -862,8 +1041,8 @@ data class ProcessingHandlerSetInputChannelPayload(
             Identifier.fromNamespaceAndPath("nodeworks", "phandler_set_input_channel")
         )
         val CODEC: StreamCodec<FriendlyByteBuf, ProcessingHandlerSetInputChannelPayload> = CustomPacketPayload.codec(
-            { p, buf -> buf.writeBlockPos(p.pos); buf.writeUtf(p.itemId, 256); buf.writeVarInt(p.channelId) },
-            { buf -> ProcessingHandlerSetInputChannelPayload(buf.readBlockPos(), buf.readUtf(256), buf.readVarInt()) }
+            { p, buf -> buf.writeBlockPos(p.pos); buf.writeUtf(p.itemId, 256); buf.writeUtf(p.componentsHash, 32); buf.writeVarInt(p.channelId) },
+            { buf -> ProcessingHandlerSetInputChannelPayload(buf.readBlockPos(), buf.readUtf(256), buf.readUtf(32), buf.readVarInt()) }
         )
     }
     override fun type() = TYPE
@@ -959,6 +1138,77 @@ data class NetworkIdBatchPayload(val newId: java.util.UUID?, val positions: List
  * [isLast] is informational so the screen can drop a "loading…" indicator
  * once the full topology is in.
  */
+/**
+ * Streams the Processing API list (resolved recipes for each ProcessingHandler)
+ * to the diagnostic GUI client-side. Carried separately from the open packet
+ * because each API can hold a dozen component-bearing ItemStacks (potions,
+ * dyed items, enchanted gear), so a network with many Processing Sets would
+ * otherwise inflate the open packet past the custom-payload size limit.
+ *
+ * Chunked the same way topology blocks are: in-order delivery on the same
+ * payload channel, [isLast] marks the final chunk for client-side loading
+ * indicator handling.
+ */
+data class DiagnosticProcessingApisChunkPayload(
+    val apis: List<damien.nodeworks.block.entity.ProcessingStorageBlockEntity.ProcessingApiInfo>,
+    val isLast: Boolean,
+) : CustomPacketPayload {
+    companion object {
+        val TYPE: CustomPacketPayload.Type<DiagnosticProcessingApisChunkPayload> = CustomPacketPayload.Type(
+            Identifier.fromNamespaceAndPath("nodeworks", "diagnostic_processing_apis_chunk")
+        )
+        val CODEC: StreamCodec<net.minecraft.network.RegistryFriendlyByteBuf, DiagnosticProcessingApisChunkPayload> = StreamCodec.of(
+            { buf, p ->
+                buf.writeBoolean(p.isLast)
+                buf.writeVarInt(p.apis.size)
+                for (api in p.apis) {
+                    buf.writeUtf(api.name, 64)
+                    buf.writeVarInt(api.inputs.size)
+                    for (ingr in api.inputs) {
+                        net.minecraft.world.item.ItemStack.OPTIONAL_STREAM_CODEC.encode(buf, ingr.stack)
+                        buf.writeVarInt(ingr.count)
+                    }
+                    buf.writeVarInt(api.outputs.size)
+                    for (ingr in api.outputs) {
+                        net.minecraft.world.item.ItemStack.OPTIONAL_STREAM_CODEC.encode(buf, ingr.stack)
+                        buf.writeVarInt(ingr.count)
+                    }
+                    buf.writeVarInt(api.timeout)
+                    buf.writeBoolean(api.serial)
+                    buf.writeBoolean(api.fuzzy)
+                }
+            },
+            { buf ->
+                val isLast = buf.readBoolean()
+                val count = buf.readVarInt()
+                val apis = (0 until count).map {
+                    val name = buf.readUtf(64)
+                    val inCount = buf.readVarInt()
+                    val inputs = (0 until inCount).map {
+                        val stack = net.minecraft.world.item.ItemStack.OPTIONAL_STREAM_CODEC.decode(buf)
+                        val cnt = buf.readVarInt()
+                        damien.nodeworks.script.RecipeIngredient(stack, cnt)
+                    }
+                    val outCount = buf.readVarInt()
+                    val outputs = (0 until outCount).map {
+                        val stack = net.minecraft.world.item.ItemStack.OPTIONAL_STREAM_CODEC.decode(buf)
+                        val cnt = buf.readVarInt()
+                        damien.nodeworks.script.RecipeIngredient(stack, cnt)
+                    }
+                    val timeout = buf.readVarInt()
+                    val serial = buf.readBoolean()
+                    val fuzzy = buf.readBoolean()
+                    damien.nodeworks.block.entity.ProcessingStorageBlockEntity.ProcessingApiInfo(
+                        name, inputs, outputs, timeout, serial, fuzzy
+                    )
+                }
+                DiagnosticProcessingApisChunkPayload(apis, isLast)
+            }
+        )
+    }
+    override fun type() = TYPE
+}
+
 data class DiagnosticTopologyChunkPayload(
     val blocks: List<damien.nodeworks.screen.DiagnosticOpenData.NetworkBlock>,
     val isLast: Boolean,

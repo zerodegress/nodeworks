@@ -121,30 +121,37 @@ class RouteTable(
 
     /**
      * Insert items using default priority routing, but ONLY into open (unrouted) storages.
+     * Enumerates source variants and moves each per-variant so a card's
+     * filter rules apply to the right variant.
      */
     fun insertDefault(source: ItemStorageHandle, filter: String, maxCount: Long): Long {
         var totalMoved = 0L
         var remaining = maxCount
-        for (card in openStorageCards) {
-            if (remaining <= 0) break
-            val destStorage = NetworkStorageHelper.getStorage(level, card) ?: continue
-            // Per-card filter gate: predicate must match BOTH the caller's filter
-            // and the card's configured rules. An ALLOW-mode card with no rules
-            // and ANY/ANY gates accepts everything (legacy behavior). Routes
-            // through `moveItemsVariant` so the per-card filter has access to
-            // `hasData` for the NBT-presence gate.
-            val cap = card.capability as? damien.nodeworks.card.StorageSideCapability
-            val moved = try {
-                PlatformServices.storage.moveItemsVariant(
-                    source, destStorage,
-                    { id, hasData ->
-                        CardHandle.matchesFilter(id, filter) && (cap == null || cap.acceptsItem(id, hasData))
-                    },
-                    remaining
-                )
-            } catch (_: Exception) { 0L }
-            totalMoved += moved
-            remaining -= moved
+        val registries = level.registryAccess()
+        val variants = PlatformServices.storage.findAllItemInfo(source) {
+            CardHandle.matchesFilter(it, filter)
+        }
+        for (info in variants) {
+            if (remaining <= 0L) break
+            val itemId = info.itemId
+            val componentsPatch = info.componentsPatch
+            val wantHash = damien.nodeworks.script.BufferKey.componentsHash(componentsPatch)
+            // Matches only this exact variant.
+            val variantPred: (net.minecraft.world.item.ItemStack) -> Boolean = { stack ->
+                val sid = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.item)?.toString()
+                sid == itemId && damien.nodeworks.script.BufferKey.componentsHash(stack) == wantHash
+            }
+            for (card in openStorageCards) {
+                if (remaining <= 0L) break
+                val cap = card.capability as? damien.nodeworks.card.StorageSideCapability
+                if (cap != null && !cap.acceptsItem(itemId, componentsPatch, registries)) continue
+                val destStorage = NetworkStorageHelper.getStorage(level, card) ?: continue
+                val moved = try {
+                    PlatformServices.storage.moveItemsByStackPredicate(source, destStorage, variantPred, remaining)
+                } catch (_: Exception) { 0L }
+                totalMoved += moved
+                remaining -= moved
+            }
         }
         return totalMoved
     }
@@ -154,18 +161,14 @@ class RouteTable(
      */
     fun insertItemStackDefault(stack: net.minecraft.world.item.ItemStack): Int {
         var remaining = stack.count
-        val itemId = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.item).toString()
-        // Vanilla's "isn't this just a default ItemStack" check: an ItemStack
-        // with no `damage`, custom data, name overrides, etc. is "no data";
-        // anything carrying NBT-equivalent state is "has data".
-        val hasData = stack.componentsPatch.isEmpty.not()
+        val registries = level.registryAccess()
         for (card in openStorageCards) {
             if (remaining <= 0) break
             // Same per-card filter gate as [insertDefault], the source here is
-            // a single concrete ItemStack so we resolve its id and hasData
-            // once and skip cards that refuse it.
+            // a single concrete ItemStack so the full component-aware check
+            // runs and `[component]` rules narrow to the variant.
             val cap = card.capability as? damien.nodeworks.card.StorageSideCapability
-            if (cap != null && !cap.acceptsItem(itemId, hasData)) continue
+            if (cap != null && !cap.acceptsItem(stack, registries)) continue
             val storage = NetworkStorageHelper.getStorage(level, card) ?: continue
             val inserted = PlatformServices.storage.insertItemStack(storage, stack.copyWithCount(remaining))
             remaining -= inserted

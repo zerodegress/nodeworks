@@ -122,6 +122,10 @@ class NodeworksJeiPlugin : IModPlugin {
             PlacerScreen::class.java,
             PlacerGhostHandler()
         )
+        registration.addGhostIngredientHandler(
+            damien.nodeworks.screen.TerminalScreen::class.java,
+            TerminalScriptEditorGhostHandler()
+        )
     }
 
     override fun registerCategories(registration: IRecipeCategoryRegistration) {
@@ -150,6 +154,21 @@ class NodeworksJeiPlugin : IModPlugin {
     override fun registerRecipeCatalysts(registration: IRecipeCatalystRegistration) {
         registration.addRecipeCatalyst(ItemStack(Items.MILK_BUCKET), MilkySoulBallRecipeCategory.RECIPE_TYPE)
         registration.addRecipeCatalyst(ItemStack(Items.SOUL_SAND), MilkySoulBallRecipeCategory.RECIPE_TYPE)
+    }
+
+    override fun onRuntimeAvailable(runtime: mezz.jei.api.runtime.IJeiRuntime) {
+        // Wire the search-bar bridge so the Inventory Terminal can mirror its
+        // search box against JEI's filter text when the player has the sync
+        // toggle on. Bridge stays installed for the lifetime of this runtime,
+        // [onRuntimeUnavailable] clears it on resource reload / disconnect.
+        val filter = runtime.ingredientFilter
+        JeiSearchBridge.getter = { filter.filterText.orEmpty() }
+        JeiSearchBridge.setter = { text -> filter.setFilterText(text) }
+    }
+
+    override fun onRuntimeUnavailable() {
+        JeiSearchBridge.getter = null
+        JeiSearchBridge.setter = null
     }
 }
 
@@ -367,9 +386,9 @@ class ProcessingSetTransferHandler : IUniversalRecipeTransferHandler<ProcessingS
             //  / modded machine), not just CraftingRecipe.
             val inputSlots = recipeSlots.getSlotViews(RecipeIngredientRole.INPUT)
             for (index in 0 until ProcessingSetScreenHandler.INPUT_SLOTS) {
-                val (itemId, count) = extractItemAndCount(inputSlots.getOrNull(index))
+                val (stack, count) = extractStackAndCount(inputSlots.getOrNull(index))
                 PlatformServices.clientNetworking.sendToServer(
-                    SetProcessingApiSlotPayload(container.containerId, index, itemId)
+                    SetProcessingApiSlotPayload(container.containerId, index, stack)
                 )
                 // Always reset the count, stale counts from previous recipes otherwise
                 //  linger when the item changes.
@@ -380,12 +399,12 @@ class ProcessingSetTransferHandler : IUniversalRecipeTransferHandler<ProcessingS
 
             val outputSlots = recipeSlots.getSlotViews(RecipeIngredientRole.OUTPUT)
             for (index in 0 until ProcessingSetScreenHandler.OUTPUT_SLOTS) {
-                val (itemId, count) = extractItemAndCount(outputSlots.getOrNull(index))
+                val (stack, count) = extractStackAndCount(outputSlots.getOrNull(index))
                 PlatformServices.clientNetworking.sendToServer(
                     SetProcessingApiSlotPayload(
                         container.containerId,
                         ProcessingSetScreenHandler.INPUT_SLOTS + index,
-                        itemId
+                        stack
                     )
                 )
                 PlatformServices.clientNetworking.sendToServer(
@@ -397,26 +416,21 @@ class ProcessingSetTransferHandler : IUniversalRecipeTransferHandler<ProcessingS
     }
 
     /**
-     * Extract (itemId, count) from a JEI slot view. Returns ("", 1) if the slot is
-     * empty, not an ItemStack, or carries non-default data components (potion
-     * contents, enchantments, stew effects). Skipping those avoids placing
-     * misleading "Uncraftable Potion" / blank-enchanted placeholders into the grid
-     *, the Processing Set only keeps `itemId:count`, so anything component-
-     * dependent can't round-trip.
-     *
-     * Count is clamped to at least 1 to preserve the set's invariant.
+     * Extract (stack, count) from a JEI slot view. Returns (EMPTY, 1) if the
+     * slot is empty or not an ItemStack. Component-bearing items (potions,
+     * enchanted books, dyed armor) are passed through with their components
+     * intact since Processing Sets now key recipes on the full DataComponents
+     * patch, not just itemId.
      */
-    private fun extractItemAndCount(
+    private fun extractStackAndCount(
         slotView: mezz.jei.api.gui.ingredient.IRecipeSlotView?
-    ): Pair<String, Int> {
-        if (slotView == null) return "" to 1
+    ): Pair<ItemStack, Int> {
+        if (slotView == null) return ItemStack.EMPTY to 1
         val displayed = slotView.displayedIngredient
-        if (!displayed.isPresent) return "" to 1
+        if (!displayed.isPresent) return ItemStack.EMPTY to 1
         val ingredient = displayed.get().ingredient
-        if (ingredient !is ItemStack || ingredient.isEmpty) return "" to 1
-        if (!ingredient.componentsPatch.isEmpty) return "" to 1
-        val id = BuiltInRegistries.ITEM.getKey(ingredient.item)?.toString() ?: ""
-        return id to ingredient.count.coerceAtLeast(1)
+        if (ingredient !is ItemStack || ingredient.isEmpty) return ItemStack.EMPTY to 1
+        return ingredient.copyWithCount(1) to ingredient.count.coerceAtLeast(1)
     }
 }
 
@@ -465,9 +479,12 @@ class ProcessingSetGhostHandler : IGhostIngredientHandler<ProcessingSetScreen> {
 
         override fun accept(ingredient: I) {
             if (ingredient !is ItemStack || ingredient.isEmpty) return
-            val itemId = BuiltInRegistries.ITEM.getKey(ingredient.item)?.toString() ?: return
+            // Carry the full stack (components and all) so dragging a
+            // Potion of Strength from JEI lands as the actual variant, not
+            // a bare uncraftable potion. The server's setSlotFromStack
+            // copies with count=1 to fit the ghost-slot contract.
             PlatformServices.clientNetworking.sendToServer(
-                SetProcessingApiSlotPayload(gui.menu.containerId, slotIndex, itemId)
+                SetProcessingApiSlotPayload(gui.menu.containerId, slotIndex, ingredient.copyWithCount(1))
             )
         }
     }
@@ -503,8 +520,7 @@ class StorageCardGhostHandler : IGhostIngredientHandler<StorageCardScreen> {
         override fun getArea(): Rect2i = area
         override fun accept(ingredient: I) {
             if (ingredient !is ItemStack || ingredient.isEmpty) return
-            val itemId = BuiltInRegistries.ITEM.getKey(ingredient.item)?.toString() ?: return
-            gui.acceptGhostItem(itemId)
+            gui.acceptGhostStack(ingredient)
         }
     }
 }
@@ -535,8 +551,7 @@ class ExportChestGhostHandler : IGhostIngredientHandler<ExportChestScreen> {
         override fun getArea(): Rect2i = area
         override fun accept(ingredient: I) {
             if (ingredient !is ItemStack || ingredient.isEmpty) return
-            val itemId = BuiltInRegistries.ITEM.getKey(ingredient.item)?.toString() ?: return
-            gui.acceptGhostItem(itemId)
+            gui.acceptGhostStack(ingredient)
         }
     }
 }
@@ -566,8 +581,7 @@ class UserGhostHandler : IGhostIngredientHandler<UserScreen> {
         override fun getArea(): Rect2i = area
         override fun accept(ingredient: I) {
             if (ingredient !is ItemStack || ingredient.isEmpty) return
-            val itemId = BuiltInRegistries.ITEM.getKey(ingredient.item)?.toString() ?: return
-            gui.acceptGhostItem(itemId)
+            gui.acceptGhostStack(ingredient)
         }
     }
 }
@@ -599,8 +613,7 @@ class BreakerGhostHandler : IGhostIngredientHandler<BreakerScreen> {
         override fun getArea(): Rect2i = area
         override fun accept(ingredient: I) {
             if (ingredient !is ItemStack || ingredient.isEmpty) return
-            val itemId = BuiltInRegistries.ITEM.getKey(ingredient.item)?.toString() ?: return
-            gui.acceptGhostItem(itemId)
+            gui.acceptGhostStack(ingredient)
         }
     }
 }
@@ -629,8 +642,56 @@ class PlacerGhostHandler : IGhostIngredientHandler<PlacerScreen> {
         override fun getArea(): Rect2i = area
         override fun accept(ingredient: I) {
             if (ingredient !is ItemStack || ingredient.isEmpty) return
-            val itemId = BuiltInRegistries.ITEM.getKey(ingredient.item)?.toString() ?: return
-            gui.acceptGhostItem(itemId)
+            gui.acceptGhostStack(ingredient)
+        }
+    }
+}
+
+/**
+ * Ghost-ingredient handler for the Scripting Terminal. The script editor's
+ * rendered region is the drop area; dropping inserts a quoted Lua string
+ * literal with the canonical `id[components]` filter form at the cursor so a
+ * player can author `network:find(<dropped>)` etc. without typing the
+ * variant string by hand.
+ *
+ * Suppresses JEI's default full-area green tint via [shouldHighlightTargets]
+ * `= false`. The terminal screen draws its own small "+" marker at the caret
+ * while the drag is active, and we tell the screen to skip text-selection
+ * drags so dragging a JEI ingredient over the editor doesn't accidentally
+ * select script text.
+ */
+class TerminalScriptEditorGhostHandler : IGhostIngredientHandler<damien.nodeworks.screen.TerminalScreen> {
+
+    override fun <I : Any> getTargetsTyped(
+        gui: damien.nodeworks.screen.TerminalScreen,
+        ingredient: ITypedIngredient<I>,
+        doStart: Boolean
+    ): List<IGhostIngredientHandler.Target<I>> {
+        if (ingredient.ingredient !is ItemStack) return emptyList()
+        val rect = gui.editorDropArea() ?: return emptyList()
+        if (doStart) gui.setJeiDragging(true)
+        return listOf(TerminalEditorTarget(gui, Rect2i(rect[0], rect[1], rect[2], rect[3])))
+    }
+
+    override fun shouldHighlightTargets(): Boolean = false
+
+    override fun onComplete() {
+        // JEI only hands us back a `Screen` here on older versions, so we
+        // can't query the active terminal directly. Instead the screen owns
+        // its own flag and clears it on render-end / mouseRelease. Belt and
+        // braces: also clear via the active-screen singleton if exposed.
+        damien.nodeworks.screen.TerminalScreen.clearJeiDraggingOnActive()
+    }
+
+    private class TerminalEditorTarget<I : Any>(
+        private val gui: damien.nodeworks.screen.TerminalScreen,
+        private val area: Rect2i,
+    ) : IGhostIngredientHandler.Target<I> {
+        override fun getArea(): Rect2i = area
+        override fun accept(ingredient: I) {
+            if (ingredient !is ItemStack || ingredient.isEmpty) return
+            gui.acceptGhostStack(ingredient)
+            gui.setJeiDragging(false)
         }
     }
 }

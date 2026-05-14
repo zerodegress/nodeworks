@@ -1,5 +1,6 @@
 package damien.nodeworks.screen
 
+import damien.nodeworks.block.entity.ProcessingStorageBlockEntity.ProcessingApiInfo
 import net.minecraft.core.BlockPos
 import net.minecraft.network.FriendlyByteBuf
 import net.minecraft.network.codec.StreamCodec
@@ -12,7 +13,13 @@ data class DiagnosticOpenData(
     val craftableItems: List<String> = emptyList(),
     val cpuInfos: List<CpuInfo> = emptyList(),
     val terminalInfos: List<TerminalInfo> = emptyList(),
-    val recentErrors: List<ErrorEntry> = emptyList()
+    val recentErrors: List<ErrorEntry> = emptyList(),
+    /** Always empty on the wire. Processing APIs stream in chunked via
+     *  [damien.nodeworks.network.DiagnosticProcessingApisChunkPayload] after
+     *  the menu opens so the open packet stays under the custom-payload size
+     *  limit even on networks with many component-bearing recipes. The field
+     *  is retained for type-compatibility but is not encoded. */
+    val processingApis: List<ProcessingApiInfo> = emptyList(),
 ) {
     data class ErrorEntry(
         val terminalPos: BlockPos,
@@ -101,7 +108,7 @@ data class DiagnosticOpenData(
                 val recentErrors = (0 until errCount).map {
                     ErrorEntry(buf.readBlockPos(), buf.readUtf(512), buf.readVarInt())
                 }
-                return DiagnosticOpenData(blocks, networkName, networkColor, networkPos, craftableItems, cpuInfos, terminalInfos, recentErrors)
+                return DiagnosticOpenData(blocks, networkName, networkColor, networkPos, craftableItems, cpuInfos, terminalInfos, recentErrors, emptyList())
             }
 
             override fun encode(buf: FriendlyByteBuf, data: DiagnosticOpenData) {

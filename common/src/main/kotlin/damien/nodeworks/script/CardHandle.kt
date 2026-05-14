@@ -11,9 +11,7 @@ import org.slf4j.LoggerFactory
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
 import net.minecraft.core.registries.BuiltInRegistries
-import net.minecraft.core.registries.Registries
 import net.minecraft.resources.Identifier
-import net.minecraft.tags.TagKey
 import net.minecraft.server.level.ServerLevel
 import org.luaj.vm2.*
 import org.luaj.vm2.lib.*
@@ -43,15 +41,6 @@ class CardHandle private constructor(
     companion object {
         private val logger = LoggerFactory.getLogger("nodeworks-cardhandle")
 
-        const val MAX_REGEX_LENGTH = 200
-        const val MAX_REGEX_CACHE_SIZE = 64
-
-        private val regexCache = object : LinkedHashMap<String, java.util.regex.Pattern>(16, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, java.util.regex.Pattern>?): Boolean {
-                return size > MAX_REGEX_CACHE_SIZE
-            }
-        }
-
         /**
          * Parse a user-facing filter string into an optional kind gate and the inner pattern.
          *
@@ -70,48 +59,92 @@ class CardHandle private constructor(
         fun matchesFilter(itemId: String, filter: String): Boolean =
             matchesFilter(itemId, ResourceKind.ITEM, filter)
 
+        /** Match by id only. Doesn't know about [DataComponentPatch], so a
+         *  filter like `minecraft:potion[...]` degrades to plain itemId matching
+         *  here. Prefer the [ItemStack] overload whenever the stack is in
+         *  hand. Used by fluid checks and a few block-id sites that never
+         *  carry component data. */
         fun matchesFilter(resourceId: String, kind: ResourceKind, filter: String): Boolean {
-            val (kindGate, inner) = parseFilterKind(filter)
-            if (kindGate != null && kindGate != kind) return false
-            return matchesIdPattern(resourceId, kind, inner)
+            val rule = cachedRule(filter, fallbackRegistries)
+            return rule.matches(resourceId, kind)
         }
 
-        private fun matchesIdPattern(resourceId: String, kind: ResourceKind, filter: String): Boolean {
-            if (filter == "*") return true
+        /** Component-aware match for an [net.minecraft.world.item.ItemStack].
+         *  Reads the per-stack components patch so a rule like
+         *  `minecraft:potion[minecraft:potion_contents={potion:"minecraft:strength"}]`
+         *  matches only the specific potion variant. */
+        fun matchesFilter(
+            stack: net.minecraft.world.item.ItemStack,
+            filter: String,
+            registries: net.minecraft.core.HolderLookup.Provider,
+        ): Boolean {
+            val rule = cachedRule(filter, registries)
+            return rule.matches(stack)
+        }
 
-            if (filter.startsWith("#")) {
-                val tagId = filter.substring(1)
-                val identifier = Identifier.tryParse(tagId) ?: return false
-                val resIdent = Identifier.tryParse(resourceId) ?: return false
-                return when (kind) {
-                    ResourceKind.ITEM -> {
-                        val tagKey = TagKey.create(Registries.ITEM, identifier)
-                        val item = BuiltInRegistries.ITEM.getValue(resIdent) ?: return false
-                        item.builtInRegistryHolder().`is`(tagKey)
-                    }
-                    ResourceKind.FLUID -> {
-                        val tagKey = TagKey.create(Registries.FLUID, identifier)
-                        val fluid = BuiltInRegistries.FLUID.getValue(resIdent) ?: return false
-                        fluid.builtInRegistryHolder().`is`(tagKey)
-                    }
-                }
+        /** Per-string parsed-rule cache. Filter strings repeat across many
+         *  match calls (Storage Card rule list evaluated per item per tick),
+         *  caching the parsed structure avoids re-invoking [ItemParser] for
+         *  component-bearing rules on every match. */
+        private val ruleCache = object : LinkedHashMap<String, FilterRule>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, FilterRule>?): Boolean {
+                return size > 256
             }
+        }
 
-            if (filter.startsWith("/") && filter.endsWith("/") && filter.length > 2) {
-                val patternStr = filter.substring(1, filter.length - 1)
-                if (patternStr.length > MAX_REGEX_LENGTH) return false
-                val pattern = regexCache.getOrPut(patternStr) {
-                    try { java.util.regex.Pattern.compile(patternStr) } catch (_: Exception) { return false }
-                }
-                return pattern.matcher(resourceId).matches()
+        @Synchronized
+        private fun cachedRule(
+            filter: String,
+            registries: net.minecraft.core.HolderLookup.Provider?,
+        ): FilterRule {
+            ruleCache[filter]?.let { return it }
+            val parsed = if (registries != null) FilterRule.parse(filter, registries)
+                else parseWithoutRegistries(filter)
+            ruleCache[filter] = parsed
+            return parsed
+        }
+
+        /** Best-effort parse when no registries are available. Drops the
+         *  `[components]` portion so the surviving shape (id / tag / regex /
+         *  namespace / sigil) still works for legacy id-only callers. */
+        private fun parseWithoutRegistries(filter: String): FilterRule {
+            val bracket = filter.indexOf('[')
+            val trimmed = if (bracket >= 0) filter.substring(0, bracket) else filter
+            return FilterRule.parse(trimmed, net.minecraft.core.HolderLookup.Provider.create(java.util.stream.Stream.empty()))
+        }
+
+        /** Captured at server start so the legacy id-only overload can still
+         *  parse `[components]` filters. Null until the first server starts,
+         *  which is fine because no script can call [matchesFilter] before
+         *  that. */
+        @Volatile
+        private var fallbackRegistries: net.minecraft.core.HolderLookup.Provider? = null
+
+        fun setFallbackRegistries(registries: net.minecraft.core.HolderLookup.Provider) {
+            fallbackRegistries = registries
+            synchronized(this) { ruleCache.clear() }
+        }
+
+        /** Public read for callers that need to parse a [FilterRule]
+         *  themselves (e.g. to extract the variant patch before dispatching
+         *  to a variant-specific storage helper). Returns null until the
+         *  server starts and sets registries. */
+        fun parsedRuleRegistries(): net.minecraft.core.HolderLookup.Provider? = fallbackRegistries
+
+        /** If [filter] parses as `Item(_, componentsPatch != null)`, returns
+         *  that patch. Used by find/count call sites to narrow results to a
+         *  specific variant. Returns null for plain filters (any variant
+         *  matches) and fluid-side filters (fluids carry no components). */
+        fun parsedVariantPatchForFind(filter: String): net.minecraft.core.component.DataComponentPatch? {
+            if (!filter.contains('[')) return null
+            val inner = when {
+                filter.startsWith("\$item:") -> filter.removePrefix("\$item:")
+                filter.startsWith("\$fluid:") -> return null
+                else -> filter
             }
-
-            if (filter.endsWith(":*")) {
-                val namespace = filter.removeSuffix(":*")
-                return resourceId.startsWith("$namespace:")
-            }
-
-            return resourceId == filter
+            val registries = fallbackRegistries ?: return null
+            val rule = cachedRule(inner, registries)
+            return (rule as? FilterRule.Item)?.componentsPatch
         }
 
         fun create(
@@ -268,20 +301,55 @@ class CardHandle private constructor(
     ): Long {
         val id = Identifier.tryParse(bufSrc.itemId) ?: return 0L
         val item = BuiltInRegistries.ITEM.getValue(id) ?: return 0L
+        // Snapshot the buffer template ONCE before any extract. The bucket
+        // gets removed when the last item is drained, so a later read of
+        // bufSrc.template would return EMPTY and we'd write bare items to
+        // the destination, losing potion variants, dye colors, enchants.
+        val capturedTemplate = bufSrc.template.let { tmpl ->
+            if (tmpl.isEmpty) net.minecraft.world.item.ItemStack(item) else tmpl.copy()
+        }
+        val templateFn: (Int) -> net.minecraft.world.item.ItemStack = { count ->
+            capturedTemplate.copyWithCount(count)
+        }
 
         if (atomic) {
-            // Pre-check atomically whether destination can accept everything. If so,
-            // extract from buffer then insert exactly that amount via the atomic primitive.
-            // If platform's real insert somehow can't match the sim (shouldn't happen on
-            // single-threaded server), we return the extracted items to the buffer.
+            // Simulate the FULL requested amount before touching the buffer,
+            // so an under-capacity destination leaves both sides untouched.
+            val maxStack = item.getDefaultMaxStackSize().toLong()
+            val capacity = try {
+                PlatformServices.storage.simulateInsertItem(destStorage, item, requested)
+            } catch (_: Exception) { 0L }
+            if (capacity < requested) return 0L
+
             val extracted = bufSrc.extract(requested)
             if (extracted < requested) {
                 bufSrc.returnUnused(extracted)
                 return 0L
             }
-            val ok = PlatformServices.storage.tryInsertAll(destStorage, item, extracted)
-            if (!ok) {
-                bufSrc.returnUnused(extracted)
+
+            var inserted = 0L
+            var remaining = extracted
+            while (remaining > 0L) {
+                val batch = minOf(remaining, maxStack)
+                val stack = templateFn(batch.toInt())
+                val put = PlatformServices.storage.insertItemStack(destStorage, stack).toLong()
+                inserted += put
+                remaining -= put
+                if (put < batch) break  // sim/commit divergence, bail to rollback
+            }
+
+            if (inserted < extracted) {
+                // Sim/commit divergence (modded storage, concurrent mutation).
+                // Pull the inserted variant back out so the move stays atomic.
+                val pulledBack = try {
+                    PlatformServices.storage.extractStacksByPredicate(
+                        destStorage,
+                        { st -> net.minecraft.world.item.ItemStack.isSameItemSameComponents(st, capturedTemplate) },
+                        inserted,
+                    )
+                } catch (_: Exception) { emptyList() }
+                val recovered = pulledBack.sumOf { it.count.toLong() }
+                bufSrc.returnUnused(extracted - inserted + recovered)
                 return 0L
             }
             return extracted
@@ -295,7 +363,7 @@ class CardHandle private constructor(
             val batch = minOf(remaining, maxStack)
             val extracted = bufSrc.extract(batch)
             if (extracted == 0L) break
-            val stack = net.minecraft.world.item.ItemStack(item, extracted.toInt())
+            val stack = templateFn(extracted.toInt())
             val inserted = PlatformServices.storage.insertItemStack(destStorage, stack).toLong()
             if (inserted < extracted) {
                 bufSrc.returnUnused(extracted - inserted)
@@ -446,16 +514,18 @@ class CardHandle private constructor(
                 if (kindGate == null || kindGate == ResourceKind.ITEM) {
                     val storage = self.getItemStorage()
                     if (storage != null) {
-                        val info = PlatformServices.storage.findFirstItemInfo(storage) { matchesFilter(it, ResourceKind.ITEM, filter) }
+                        val variantPatch = parsedVariantPatchForFind(filter)
+                        val wantHash = variantPatch?.let { damien.nodeworks.script.BufferKey.componentsHash(it) }
+                        val candidates = PlatformServices.storage.findAllItemInfo(storage) {
+                            matchesFilter(it, ResourceKind.ITEM, filter)
+                        }
+                        val narrowed = if (wantHash != null) {
+                            candidates.filter { damien.nodeworks.script.BufferKey.componentsHash(it.componentsPatch) == wantHash }
+                        } else candidates
+                        val info = narrowed.firstOrNull()
                         if (info != null) {
-                            val totalCount = PlatformServices.storage.countItems(storage) { matchesFilter(it, ResourceKind.ITEM, filter) }
-                            val aggregatedInfo = damien.nodeworks.platform.ItemInfo(
-                                itemId = info.itemId,
-                                name = info.name,
-                                count = totalCount,
-                                maxStackSize = info.maxStackSize,
-                                hasData = info.hasData
-                            )
+                            val totalCount = narrowed.sumOf { it.count }
+                            val aggregatedInfo = info.copy(count = totalCount)
                             val sourceStorage: () -> damien.nodeworks.platform.ItemStorageHandle? = { self.getItemStorage() }
                             return ItemsHandle.toLuaTable(ItemsHandle.fromItemInfo(aggregatedInfo, filter, sourceStorage, level))
                         }

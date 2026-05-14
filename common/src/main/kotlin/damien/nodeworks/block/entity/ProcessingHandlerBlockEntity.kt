@@ -101,11 +101,22 @@ class ProcessingHandlerBlockEntity(
     var processingApiName: String = ""
         private set
 
-    /** Per-input-itemId channel. Routed inputs land on storage cards in the
-     *  micro-network whose channel matches the entry for that itemId.
-     *  Defaults to [DyeColor.BLUE] for new entries, which the UI populates
-     *  the first time a player binds a Set. */
-    private val inputChannelsByItem = mutableMapOf<String, DyeColor>()
+    /** Per-input-variant channel. Keyed on [damien.nodeworks.script.BufferKey.Key]
+     *  so the same recipe can bind different channels to different variants of
+     *  the same itemId (e.g. Strength Potion on BLUE and Fire Resistance Potion
+     *  on RED). Plain inputs use an empty `componentsHash` and behave like the
+     *  legacy itemId-only map. Defaults to [DyeColor.BLUE] for new entries. */
+    private val inputChannelsByKey = mutableMapOf<damien.nodeworks.script.BufferKey.Key, DyeColor>()
+
+    /** Sidecar map keeping each input's full [DataComponentPatch] alongside its
+     *  [BufferKey.Key] entry in [inputChannelsByKey]. Persistence writes
+     *  these patches (encoded via [DataComponentPatch.CODEC] under
+     *  [RegistryOps]) so the in-session unstable component hash can be
+     *  re-derived consistently after a world reload; without it, persisting
+     *  the unstable hash directly would let channel assignments drift to
+     *  default when Holder.Reference identity changes across sessions.
+     *  Plain-item entries map to [DataComponentPatch.EMPTY]. */
+    private val inputPatchesByKey = mutableMapOf<damien.nodeworks.script.BufferKey.Key, net.minecraft.core.component.DataComponentPatch>()
 
     /** Output channel. The UI doesn't expose per-output editing, so a single
      *  shared color suffices. Storage cards on the micro-network with this
@@ -113,17 +124,29 @@ class ProcessingHandlerBlockEntity(
     var outputChannel: DyeColor = DyeColor.RED
         private set
 
+    /** Looks up the channel for an ingredient by full variant identity. */
+    fun getInputChannel(key: damien.nodeworks.script.BufferKey.Key): DyeColor =
+        inputChannelsByKey[key] ?: DyeColor.BLUE
+
+    /** Backwards-compat lookup by itemId only. Returns the first registered
+     *  entry sharing the id (regardless of variant), or BLUE when none. Only
+     *  meaningful for callers that don't know the variant. */
     fun getInputChannel(itemId: String): DyeColor =
-        inputChannelsByItem[itemId] ?: DyeColor.BLUE
+        inputChannelsByKey.entries.firstOrNull { it.key.itemId == itemId }?.value ?: DyeColor.BLUE
 
     /** Snapshot of the per-input channel map. Returns a copy so callers can't
      *  mutate the BE's internal state. */
-    fun snapshotInputChannels(): Map<String, DyeColor> = inputChannelsByItem.toMap()
+    fun snapshotInputChannels(): Map<damien.nodeworks.script.BufferKey.Key, DyeColor> = inputChannelsByKey.toMap()
 
-    fun bindToProcessingSet(name: String, inputItemIds: Collection<String>) {
+    fun bindToProcessingSet(name: String, inputs: Collection<damien.nodeworks.script.RecipeIngredient>) {
         processingApiName = name
-        inputChannelsByItem.clear()
-        for (id in inputItemIds) inputChannelsByItem[id] = DyeColor.BLUE
+        inputChannelsByKey.clear()
+        inputPatchesByKey.clear()
+        for (ingr in inputs) {
+            val key = ingr.bufferKey()
+            inputChannelsByKey[key] = DyeColor.BLUE
+            inputPatchesByKey[key] = ingr.stack.componentsPatch
+        }
         outputChannel = DyeColor.RED
         markDirtyAndSync()
         if (level is ServerLevel) {
@@ -133,7 +156,8 @@ class ProcessingHandlerBlockEntity(
 
     fun unbind() {
         processingApiName = ""
-        inputChannelsByItem.clear()
+        inputChannelsByKey.clear()
+        inputPatchesByKey.clear()
         outputChannel = DyeColor.RED
         markDirtyAndSync()
         if (level is ServerLevel) {
@@ -151,18 +175,18 @@ class ProcessingHandlerBlockEntity(
         damien.nodeworks.script.cpu.BlockHandlerRegistry.syncFromBE(this)
     }
 
-    fun setInputChannel(itemId: String, color: DyeColor) {
-        if (!inputChannelsByItem.containsKey(itemId)) return
-        if (inputChannelsByItem[itemId] == color) return
-        inputChannelsByItem[itemId] = color
+    fun setInputChannel(key: damien.nodeworks.script.BufferKey.Key, color: DyeColor) {
+        if (!inputChannelsByKey.containsKey(key)) return
+        if (inputChannelsByKey[key] == color) return
+        inputChannelsByKey[key] = color
         markDirtyAndSync()
     }
 
     fun setAllInputChannels(color: DyeColor) {
         var changed = false
-        for (key in inputChannelsByItem.keys.toList()) {
-            if (inputChannelsByItem[key] != color) {
-                inputChannelsByItem[key] = color
+        for (key in inputChannelsByKey.keys.toList()) {
+            if (inputChannelsByKey[key] != color) {
+                inputChannelsByKey[key] = color
                 changed = true
             }
         }
@@ -299,14 +323,31 @@ class ProcessingHandlerBlockEntity(
         output.putBlockPosList("connections", connections)
         output.putString("processingApiName", processingApiName)
         output.putInt("outputChannel", outputChannel.id)
-        // Per-input channels packed as parallel itemId / channelId lists.
-        // Two parallel arrays beat a sub-tag map for predictable codec order
-        // and small payload size when many handlers share an inventory cache.
-        val inputIds = inputChannelsByItem.keys.toList()
-        output.putInt("inputCount", inputIds.size)
-        for ((index, id) in inputIds.withIndex()) {
-            output.putString("inputId$index", id)
-            output.putInt("inputChannel$index", (inputChannelsByItem[id] ?: DyeColor.BLUE).id)
+        // Per-input channels packed as parallel (itemId, patch, channelId)
+        // lists. The patch is encoded via [DataComponentPatch.CODEC] under
+        // [RegistryOps] so it round-trips by registry id rather than by
+        // Holder.Reference identity (the in-session hash carried on
+        // [BufferKey.Key] is unstable across reloads). On load the patch is
+        // decoded, fed through [BufferKey.componentsHash] using the new
+        // session's registries, and the freshly-derived Key matches the
+        // ones produced by bound recipes in that same session.
+        val keys = inputChannelsByKey.keys.toList()
+        output.putInt("inputCount", keys.size)
+        val registries = level?.registryAccess()
+        val ops = if (registries != null)
+            net.minecraft.resources.RegistryOps.create(net.minecraft.nbt.NbtOps.INSTANCE, registries)
+        else null
+        for ((index, k) in keys.withIndex()) {
+            output.putString("inputId$index", k.itemId)
+            val patch = inputPatchesByKey[k] ?: net.minecraft.core.component.DataComponentPatch.EMPTY
+            val patchTag: net.minecraft.nbt.Tag? = if (patch.size() > 0 && ops != null) {
+                net.minecraft.core.component.DataComponentPatch.CODEC
+                    .encodeStart(ops, patch).result().orElse(null)
+            } else null
+            if (patchTag is net.minecraft.nbt.CompoundTag) {
+                output.store("inputPatch$index", net.minecraft.nbt.CompoundTag.CODEC, patchTag)
+            }
+            output.putInt("inputChannel$index", (inputChannelsByKey[k] ?: DyeColor.BLUE).id)
         }
     }
 
@@ -331,14 +372,38 @@ class ProcessingHandlerBlockEntity(
         processingApiName = input.getStringOr("processingApiName", "")
         outputChannel = runCatching { DyeColor.byId(input.getIntOr("outputChannel", DyeColor.RED.id)) }
             .getOrDefault(DyeColor.RED)
-        inputChannelsByItem.clear()
+        inputChannelsByKey.clear()
+        inputPatchesByKey.clear()
         val count = input.getIntOr("inputCount", 0).coerceAtLeast(0)
+        val registries = level?.registryAccess()
+        val ops = if (registries != null)
+            net.minecraft.resources.RegistryOps.create(net.minecraft.nbt.NbtOps.INSTANCE, registries)
+        else null
         for (index in 0 until count) {
             val id = input.getStringOr("inputId$index", "")
             if (id.isEmpty()) continue
+            // New saves carry the encoded patch; decode it and recompute the
+            // in-session unstable hash so the Key matches what runtime
+            // recipe-binding produces in this session. Legacy saves with
+            // only the old [inputHash$index] field fall back to that string
+            // (best-effort: it may not match the new session's hash for
+            // component-bearing entries, but plain entries always work).
+            val patchTag = ops?.let {
+                input.read("inputPatch$index", net.minecraft.nbt.CompoundTag.CODEC).orElse(null)
+            }
+            val patch: net.minecraft.core.component.DataComponentPatch =
+                if (patchTag != null && ops != null) {
+                    net.minecraft.core.component.DataComponentPatch.CODEC
+                        .parse(ops, patchTag).result()
+                        .orElse(net.minecraft.core.component.DataComponentPatch.EMPTY)
+                } else net.minecraft.core.component.DataComponentPatch.EMPTY
+            val hash = if (patch.size() > 0) damien.nodeworks.script.BufferKey.componentsHash(patch)
+                else input.getStringOr("inputHash$index", "")
             val ch = runCatching { DyeColor.byId(input.getIntOr("inputChannel$index", DyeColor.BLUE.id)) }
                 .getOrDefault(DyeColor.BLUE)
-            inputChannelsByItem[id] = ch
+            val key = damien.nodeworks.script.BufferKey.Key(id, hash)
+            inputChannelsByKey[key] = ch
+            inputPatchesByKey[key] = patch
         }
     }
 

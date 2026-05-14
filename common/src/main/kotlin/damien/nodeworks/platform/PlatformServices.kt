@@ -141,6 +141,35 @@ interface StorageService {
         return moveItems(source, dest, { filter(it, false) }, maxCount)
     }
 
+    /** Move items with a full-stack filter. The [filter] sees each candidate
+     *  slot's [ItemStack], so callers can match on component-bearing identity.
+     *  Use this instead of [moveItemsVariant] when routing a specific variant:
+     *  the `(itemId, hasData)` predicate there can't tell a Strength Potion
+     *  from a Healing Potion.
+     *
+     *  Loaders should override with a slot-walking variant; the default
+     *  extract-then-insert path re-inserts rejects back into [source]. */
+    fun moveItemsByStackPredicate(
+        source: ItemStorageHandle,
+        dest: ItemStorageHandle,
+        filter: (ItemStack) -> Boolean,
+        maxCount: Long,
+    ): Long {
+        if (maxCount <= 0L) return 0L
+        val extracted = extractStacksByPredicate(source, filter, maxCount)
+        var moved = 0L
+        for (stack in extracted) {
+            if (stack.isEmpty) continue
+            val inserted = insertItemStack(dest, stack)
+            moved += inserted
+            // Keep the move loss-free: return what dest rejected to source.
+            if (inserted < stack.count) {
+                insertItemStack(source, stack.copyWithCount(stack.count - inserted))
+            }
+        }
+        return moved
+    }
+
     /** Count items matching filter in a storage. */
     fun countItems(storage: ItemStorageHandle, filter: (String) -> Boolean): Long
 
@@ -169,6 +198,46 @@ interface StorageService {
         filter: (String) -> Boolean,
         maxCount: Long,
     ): List<ItemStack>
+
+    /** Stack-aware extract: the [filter] sees the full [ItemStack] of each
+     *  candidate slot, so callers can match by (itemId + DataComponents).
+     *  Used by the planner's Pull op to extract a specific variant (e.g. a
+     *  Strength Potion specifically, not just any potion). Default
+     *  implementation delegates to [extractItemStacksMatching] with an
+     *  itemId-only filter and then post-filters the returned stacks, which
+     *  is correct but extracts more than necessary from storage on a
+     *  mixed-variant chest. Loaders should override with a slot-walking
+     *  variant for efficiency. */
+    fun extractStacksByPredicate(
+        storage: ItemStorageHandle,
+        filter: (ItemStack) -> Boolean,
+        maxCount: Long,
+    ): List<ItemStack> {
+        // Default: extract everything matching by itemId-of-anything-stored, then
+        // filter the returned stacks and re-insert the rejects. Loaders can do
+        // better by walking slots directly.
+        val all = extractItemStacksMatching(storage, { true }, maxCount)
+        val keep = ArrayList<ItemStack>(all.size)
+        var kept = 0L
+        for (stack in all) {
+            if (kept < maxCount && filter(stack)) {
+                keep.add(stack)
+                kept += stack.count
+            } else {
+                insertItemStack(storage, stack)
+            }
+        }
+        return keep
+    }
+
+    /** Stack-aware count: sums every slot whose [filter] returns true. Used
+     *  by the planner's feasibility check to count specific variants (not
+     *  every variant sharing an itemId). Default implementation delegates
+     *  via a non-mutating slot scan in the loader. */
+    fun countStacksByPredicate(
+        storage: ItemStorageHandle,
+        filter: (ItemStack) -> Boolean,
+    ): Long = 0L
 
     /** Insert an ItemStack into storage. Returns count actually inserted. */
     fun insertItemStack(storage: ItemStorageHandle, stack: net.minecraft.world.item.ItemStack): Int

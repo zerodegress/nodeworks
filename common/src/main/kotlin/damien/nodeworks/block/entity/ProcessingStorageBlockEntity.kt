@@ -55,21 +55,23 @@ class ProcessingStorageBlockEntity(
     override var blockDestroyed: Boolean = false
     override var networkId: UUID? = null
 
-    /** Returns all non-empty Processing Sets in THIS storage block. */
+    /** Returns all non-empty Processing Sets in THIS storage block.
+     *  Inputs and outputs are component-aware [RecipeIngredient]s and the
+     *  [ProcessingApiInfo.name] carries the `recipe_<hash>` identity. */
     fun getProcessingApis(): List<ProcessingApiInfo> {
         val result = mutableListOf<ProcessingApiInfo>()
+        val registries = level?.registryAccess() ?: return emptyList()
         for (i in 0 until TOTAL_SLOTS) {
             val stack = items[i]
             if (stack.isEmpty || stack.item !is ProcessingSet) continue
-            val inputs = ProcessingSet.getInputs(stack)
-            val outputs = ProcessingSet.getOutputs(stack)
+            val inputs = ProcessingSet.getInputs(stack, registries)
+            val outputs = ProcessingSet.getOutputs(stack, registries)
             val timeout = ProcessingSet.getTimeout(stack)
             val serial = ProcessingSet.isSerial(stack)
+            val fuzzy = ProcessingSet.isFuzzy(stack)
             if (outputs.isEmpty()) continue
-            // Always use the canonical recipe-derived id, the NBT-stored `name` field
-            // is vestigial and may hold legacy pre-Phase-A values from older worlds.
-            val name = ProcessingSet.canonicalId(inputs, outputs)
-            result.add(ProcessingApiInfo(name, inputs, outputs, timeout, serial))
+            val name = ProcessingSet.computeRecipeId(stack, registries)
+            result.add(ProcessingApiInfo(name, inputs, outputs, timeout, serial, fuzzy))
         }
         return result
     }
@@ -110,15 +112,67 @@ class ProcessingStorageBlockEntity(
         return cluster
     }
 
+    /** Runtime description of a Processing Set recipe. Inputs and outputs
+     *  carry full [ItemStack]s via [RecipeIngredient] so component-bearing
+     *  recipes (different potions, dyed armor) flow through the planner
+     *  and handler dispatch with their identity intact. The [name] field
+     *  carries the `recipe_<hash>` identity and the [fuzzy] flag signals
+     *  "accept any component variant" semantics. */
     data class ProcessingApiInfo(
         val name: String,
-        val inputs: List<Pair<String, Int>>,
-        val outputs: List<Pair<String, Int>>,
+        val inputs: List<damien.nodeworks.script.RecipeIngredient>,
+        val outputs: List<damien.nodeworks.script.RecipeIngredient>,
         val timeout: Int,
-        val serial: Boolean = false
+        val serial: Boolean = false,
+        val fuzzy: Boolean = false,
+        /** Optional pre-computed `(itemId, count)` projections. Non-null only
+         *  for fixtures built via [fromPairs] (unit tests, which can't touch
+         *  [net.minecraft.core.registries.BuiltInRegistries] at runtime).
+         *  When null, [inputsAsPairs] / [outputsAsPairs] derive from the
+         *  full [inputs] / [outputs] ingredient lists. */
+        private val inputsPairsOverride: List<Pair<String, Int>>? = null,
+        private val outputsPairsOverride: List<Pair<String, Int>>? = null,
     ) {
-        /** All output item IDs. */
-        val outputItemIds: List<String> get() = outputs.map { it.first }
+        /** All output item IDs. Strips components, used by consumers that just
+         *  need to know which items the recipe can produce by name. */
+        val outputItemIds: List<String> get() = outputsAsPairs.map { it.first }
+
+        /** Legacy `(itemId, count)` projection for consumers that haven't
+         *  been widened to component-aware reads yet. Components are dropped. */
+        val inputsAsPairs: List<Pair<String, Int>>
+            get() = inputsPairsOverride ?: inputs.map { it.itemId to it.count }
+        val outputsAsPairs: List<Pair<String, Int>>
+            get() = outputsPairsOverride ?: outputs.map { it.itemId to it.count }
+
+        companion object {
+            /** Test/legacy fixture: build a [ProcessingApiInfo] from
+             *  `(itemId, count)` pairs without constructing real
+             *  [damien.nodeworks.script.RecipeIngredient]s. Routes the pairs
+             *  through the [inputsPairsOverride] / [outputsPairsOverride]
+             *  fields so [inputsAsPairs] still returns them, while [inputs]
+             *  / [outputs] stay empty (no [net.minecraft.world.item.ItemStack]
+             *  construction, no [net.minecraft.core.registries.BuiltInRegistries]
+             *  lookup). Used by [damien.nodeworks.script.diagnostics] unit
+             *  tests whose runtime classpath lacks Minecraft. */
+            @JvmStatic
+            fun fromPairs(
+                name: String,
+                inputs: List<Pair<String, Int>>,
+                outputs: List<Pair<String, Int>> = emptyList(),
+                timeout: Int = 0,
+                serial: Boolean = false,
+                fuzzy: Boolean = false,
+            ): ProcessingApiInfo = ProcessingApiInfo(
+                name = name,
+                inputs = emptyList(),
+                outputs = emptyList(),
+                timeout = timeout,
+                serial = serial,
+                fuzzy = fuzzy,
+                inputsPairsOverride = inputs,
+                outputsPairsOverride = outputs,
+            )
+        }
     }
 
     // --- Connectable ---

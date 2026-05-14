@@ -44,6 +44,11 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         private val logger = LoggerFactory.getLogger(MOD_ID)
         var tickCount = 0L
             private set
+
+        // Per-player last-tick map for Diagnostic craft-preview throttling.
+        // Touched from the netty payload handler thread and the main thread, so
+        // it must be concurrent.
+        private val diagnosticPreviewLastTick = java.util.concurrent.ConcurrentHashMap<java.util.UUID, Long>()
     }
 
     init {
@@ -77,6 +82,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
 
         // Register game events on the NeoForge event bus
         NeoForge.EVENT_BUS.addListener(::onServerTick)
+        NeoForge.EVENT_BUS.addListener(::onServerStarting)
         NeoForge.EVENT_BUS.addListener(::onServerStopping)
         NeoForge.EVENT_BUS.addListener(::onPlayerDisconnect)
         NeoForge.EVENT_BUS.addListener(::onRightClickBlock)
@@ -373,7 +379,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                     if (payload.kind == 1.toByte()) {
                         menu.handleFluidGridClick(player, payload.itemId, payload.action)
                     } else {
-                        menu.handleGridClick(player, payload.itemId, payload.action)
+                        menu.handleGridClick(player, payload.itemId, payload.action, payload.componentsPatch)
                     }
                 }
             }
@@ -392,7 +398,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                 val player = context.player()
                 val menu = player.containerMenu
                 if (menu is damien.nodeworks.screen.InventoryTerminalMenu && menu.containerId == payload.containerId) {
-                    menu.handleCraftRequest(player, payload.itemId, payload.count)
+                    menu.handleCraftRequest(player, payload.itemId, payload.count, payload.componentsPatch)
                 }
             }
         }
@@ -574,6 +580,10 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                             menu.serial = payload.value != 0
                             menu.markDirty()
                         }
+                        "fuzzy" -> {
+                            menu.fuzzy = payload.value != 0
+                            menu.markDirty()
+                        }
                     }
                 }
             }
@@ -658,7 +668,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                 if (!player.blockPosition().closerThan(payload.pos, 8.0)) return@enqueueWork
                 val entity = level.getBlockEntity(payload.pos) as? damien.nodeworks.block.entity.ProcessingHandlerBlockEntity ?: return@enqueueWork
                 val color = runCatching { net.minecraft.world.item.DyeColor.byId(payload.channelId) }.getOrNull() ?: return@enqueueWork
-                entity.setInputChannel(payload.itemId, color)
+                entity.setInputChannel(damien.nodeworks.script.BufferKey.Key(payload.itemId, payload.componentsHash), color)
             }
         }
         registrar.playToServer(
@@ -723,9 +733,29 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         registrar.playToServer(CraftPreviewRequestPayload.TYPE, CraftPreviewRequestPayload.CODEC) { payload, context ->
             context.enqueueWork {
                 val player = context.player()
+                // Gate the preview to players who actually have the Diagnostic
+                // menu open at the exact network position they're previewing.
+                // Without this gate any client could spam network discoveries
+                // for arbitrary positions and force expensive planner runs.
+                val menu = player.containerMenu
+                if (menu !is damien.nodeworks.screen.DiagnosticMenu) return@enqueueWork
+                if (menu.containerId != payload.containerId) return@enqueueWork
+                if (menu.clickedPos != payload.networkPos) return@enqueueWork
+                // Per-player request throttle. Diagnostic preview is a
+                // bounded-depth tree walk (depth 20) but still walks the
+                // network; cap to 10 requests/sec to fence off accidental
+                // or hostile spam from a modified client.
+                val now = (player.level() as? ServerLevel)?.server?.tickCount?.toLong() ?: 0L
+                val last = diagnosticPreviewLastTick[player.uuid] ?: Long.MIN_VALUE
+                if (now - last < 2) return@enqueueWork
+                diagnosticPreviewLastTick[player.uuid] = now
+
                 val level = player.level() as? ServerLevel ?: return@enqueueWork
                 val snapshot = damien.nodeworks.network.NetworkDiscovery.discoverNetwork(level, payload.networkPos)
-                val tree = damien.nodeworks.script.CraftTreeBuilder.buildCraftTree(payload.itemId, 1, level, snapshot)
+                val tree = damien.nodeworks.script.CraftTreeBuilder.buildCraftTree(
+                    payload.itemId, 1, level, snapshot,
+                    componentsPatch = payload.componentsPatch,
+                )
                 val serverPlayer = player as? net.minecraft.server.level.ServerPlayer ?: return@enqueueWork
                 val packet = net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket(CraftPreviewResponsePayload(payload.containerId, tree))
                 serverPlayer.connection.send(packet)
@@ -737,7 +767,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                 val player = context.player()
                 val menu = player.containerMenu
                 if (menu is damien.nodeworks.screen.ProcessingSetScreenHandler && menu.containerId == payload.containerId) {
-                    menu.setSlotFromId(payload.slotIndex, payload.itemId)
+                    menu.setSlotFromStack(payload.slotIndex, payload.stack)
                 }
             }
         }
@@ -878,6 +908,17 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         }
 
         registrar.playToClient(
+            damien.nodeworks.network.DiagnosticProcessingApisChunkPayload.TYPE,
+            damien.nodeworks.network.DiagnosticProcessingApisChunkPayload.CODEC,
+        ) { payload, context ->
+            context.enqueueWork {
+                val player = net.minecraft.client.Minecraft.getInstance().player ?: return@enqueueWork
+                val menu = player.containerMenu as? damien.nodeworks.screen.DiagnosticMenu ?: return@enqueueWork
+                menu.appendProcessingApisChunk(payload.apis, payload.isLast)
+            }
+        }
+
+        registrar.playToClient(
             damien.nodeworks.network.ProcessingHandlerStateSyncPayload.TYPE,
             damien.nodeworks.network.ProcessingHandlerStateSyncPayload.CODEC,
         ) { payload, context ->
@@ -915,6 +956,13 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         damien.nodeworks.command.NodeworksCommand.register(event.dispatcher)
     }
 
+    private fun onServerStarting(event: net.neoforged.neoforge.event.server.ServerStartingEvent) {
+        // Hand the server's registry access to the id-only matchesFilter
+        // overload so legacy callers can still resolve component-bearing
+        // rules like `minecraft:potion[minecraft:potion_contents={...}]`.
+        damien.nodeworks.script.CardHandle.setFallbackRegistries(event.server.registryAccess())
+    }
+
     private fun onServerStopping(event: net.neoforged.neoforge.event.server.ServerStoppingEvent) {
         damien.nodeworks.script.ResumeScheduler.onServerStop()
         // Drop the block-handler index. Entries are repopulated on chunk
@@ -934,6 +982,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
 
     private fun onPlayerDisconnect(event: net.neoforged.neoforge.event.entity.player.PlayerEvent.PlayerLoggedOutEvent) {
         damien.nodeworks.item.NetworkWrenchItem.clearSelection(event.entity.uuid)
+        diagnosticPreviewLastTick.remove(event.entity.uuid)
     }
 
     private fun onRightClickBlock(event: net.neoforged.neoforge.event.entity.player.PlayerInteractEvent.RightClickBlock) {

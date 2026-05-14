@@ -77,7 +77,7 @@ class CraftingCoreBlockEntity(
     private val opExecutor: CpuOpExecutor = CpuOpExecutor(this)
 
     /** The scheduler that drives all in-flight crafts for this CPU.
-     *  Phase 2 uses a single thread, Phase 3 adds one per Co-Processor. */
+     *  Currently single-threaded, Co-Processor blocks will add threads. */
     val scheduler: CraftScheduler = CraftScheduler(threadCount = 1, executor = opExecutor)
 
     /** Number of Co-Processor blocks discovered in the last multiblock scan. */
@@ -226,8 +226,10 @@ class CraftingCoreBlockEntity(
     @Transient
     var craftTreeSnapshot: damien.nodeworks.script.CraftTreeBuilder.CraftTreeNode? = null
 
-    /** Expected outputs per operation: list of (itemId, count). Long-safe. */
-    var pendingOutputs: List<Pair<String, Long>> = emptyList()
+    /** Expected outputs per operation: (template stack, count). The stack
+     *  carries variant components so a resumed poll matches the exact
+     *  output variant, not any item sharing the id. */
+    var pendingOutputs: List<Pair<net.minecraft.world.item.ItemStack, Long>> = emptyList()
         private set
 
     /** Number of async processing operations still pending. */
@@ -255,7 +257,10 @@ class CraftingCoreBlockEntity(
      * Called when job:pull() registers an async poll. Captures the pull target
      * coordinates and increments the pending count.
      */
-    fun addPendingOp(outputs: List<Pair<String, Long>>, pullTargets: List<Pair<BlockPos, net.minecraft.core.Direction>>) {
+    fun addPendingOp(
+        outputs: List<Pair<net.minecraft.world.item.ItemStack, Long>>,
+        pullTargets: List<Pair<BlockPos, net.minecraft.core.Direction>>,
+    ) {
         if (pendingOutputs.isEmpty()) pendingOutputs = outputs
         if (pendingPullTargets.isEmpty() && pullTargets.isNotEmpty()) pendingPullTargets = pullTargets
         pendingCount++
@@ -272,10 +277,13 @@ class CraftingCoreBlockEntity(
     /** Per-op resume state, captured when a Process op's handler registers a pull, used
      *  on world reload to restart polling without re-invoking the handler. The handler's
      *  side effects (items placed in machines) survive the reload as actual block state,
-     *  we just need to keep watching for the outputs to arrive. */
+     *  we just need to keep watching for the outputs to arrive.
+     *
+     *  [outputs] pairs a template [ItemStack] (carrying variant components)
+     *  with the remaining count so a resumed poll matches the exact variant. */
     data class OpResumeInfo(
         val processingApiName: String,
-        val outputs: List<Pair<String, Long>>,
+        val outputs: List<Pair<net.minecraft.world.item.ItemStack, Long>>,
         val pullTargets: List<Pair<BlockPos, net.minecraft.core.Direction>>
     )
 
@@ -341,6 +349,16 @@ class CraftingCoreBlockEntity(
         return true
     }
 
+    /** Component-aware buffer insertion. Use this when the caller has a real
+     *  [ItemStack] (e.g. just pulled from storage) so durability / potion
+     *  contents / dye colour / enchantments live in the buffer template
+     *  instead of being stripped by the itemId-only overload. */
+    fun addToBuffer(stack: net.minecraft.world.item.ItemStack, count: Long): Boolean {
+        if (!bufferState.insert(stack, count)) return false
+        setChanged()
+        return true
+    }
+
     /**
      * Remove up to [count] of [itemId] from the buffer.
      * Returns the amount actually removed (≤ count, 0 if nothing to remove).
@@ -351,11 +369,51 @@ class CraftingCoreBlockEntity(
         return removed
     }
 
+    /** Component-aware buffer extraction. Targets a specific variant via
+     *  [key] so a strength-potion bucket isn't drained by a healing-potion
+     *  request. Returns the actual count extracted. */
+    fun removeFromBuffer(key: damien.nodeworks.script.BufferKey.Key, count: Long): Long {
+        val removed = bufferState.extract(key, count)
+        if (removed > 0) setChanged()
+        return removed
+    }
+
+    /** Template stack the buffer is using to represent variant [key]. Carries
+     *  the components of the first instance inserted into that bucket. Used
+     *  by [damien.nodeworks.script.BufferSource] / [CardHandle.moveFromBuffer]
+     *  to rebuild extracted stacks with their full components instead of a
+     *  bare `ItemStack(item, count)`. */
+    fun getBufferTemplate(key: damien.nodeworks.script.BufferKey.Key): net.minecraft.world.item.ItemStack? =
+        bufferState.template(key)
+
     fun getBufferCount(itemId: String): Long = bufferState.get(itemId)
 
-    fun getBufferContents(): Map<String, Long> = bufferState.contents()
+    fun getBufferCount(key: damien.nodeworks.script.BufferKey.Key): Long = bufferState.get(key)
 
+    /** Legacy itemId-flattened snapshot. New callers should use
+     *  [bufferState] directly to access component-aware buckets. */
+    fun getBufferContents(): Map<String, Long> = bufferState.contentsByItemId()
+
+    /** Legacy itemId-flattened clear. Returns the contents as itemId → count so
+     *  pre-component callers (which dump the buffer back into network storage
+     *  by itemId) keep working. Component variants are summed under their item
+     *  id during the flattening, which is lossy but matches the legacy
+     *  behaviour those callers expect. */
     fun clearBuffer(): Map<String, Long> {
+        val contents = bufferState.clear()
+        if (contents.isEmpty()) return emptyMap()
+        setChanged()
+        val flat = LinkedHashMap<String, Long>()
+        for ((k, e) in contents) flat.merge(k.itemId, e.count) { a, b -> a + b }
+        return flat
+    }
+
+    /** Component-aware clear. Returns per-bucket [BufferState.Entry] (each
+     *  carrying a template ItemStack with components + a Long count). Use
+     *  this when flushing the buffer back to network storage so potion
+     *  variants and other component-bearing items don't get stripped to
+     *  bare uncraftable placeholders on the way out. */
+    fun clearBufferComponentAware(): Map<damien.nodeworks.script.BufferKey.Key, damien.nodeworks.script.cpu.BufferState.Entry> {
         val contents = bufferState.clear()
         if (contents.isNotEmpty()) setChanged()
         return contents
@@ -681,11 +739,15 @@ class CraftingCoreBlockEntity(
             }
         }
 
-        // Synthetic API info, only outputs matter for polling.
-        // ProcessingApiInfo.outputs is (String, Int). We down-cast our Long pendingOutputs
-        // for the synthetic API (the underlying processing pipeline will be refactored in
-        // a later phase to handle Long end-to-end).
-        val syntheticOutputs = pendingOutputs.map { it.first to it.second.coerceAtMost(Int.MAX_VALUE.toLong()).toInt() }
+        // Synthetic API, only outputs drive the poll. Template stacks carry
+        // variant components so the poll matches the exact output variant.
+        val syntheticOutputs = pendingOutputs.mapNotNull { (template, ct) ->
+            if (template.isEmpty) return@mapNotNull null
+            damien.nodeworks.script.RecipeIngredient(
+                template.copyWithCount(1),
+                ct.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+            )
+        }
         val apiInfo = damien.nodeworks.block.entity.ProcessingStorageBlockEntity.ProcessingApiInfo(
             name = "resume",
             inputs = emptyList(),
@@ -806,14 +868,18 @@ class CraftingCoreBlockEntity(
 
         // Buffer state, the BufferState helper still speaks the CompoundTag API internally
         // (streaming ValueOutput doesn't help here since the data is a small fixed blob),
-        // so we round-trip via CompoundTag.CODEC as a store child.
+        // so we round-trip via CompoundTag.CODEC as a store child. The registry access
+        // is needed so component-bearing buffered items (potions etc) encode their
+        // potion-effect / enchantment / banner-pattern references against the world's
+        // registries.
         val bufferTag = CompoundTag()
-        bufferState.saveToNBT(bufferTag)
+        bufferState.saveToNBT(bufferTag, level!!.registryAccess())
         output.store("bufferState", CompoundTag.CODEC, bufferTag)
 
-        // Scheduler state, same pattern.
+        // Scheduler state. Registries let a Pull op's component patch persist
+        // by registry id rather than the session-unstable in-memory hash.
         val schedulerTag = CompoundTag()
-        scheduler.saveToNBT(schedulerTag)
+        scheduler.saveToNBT(schedulerTag, level!!.registryAccess())
         output.store("scheduler", CompoundTag.CODEC, schedulerTag)
 
         // Original craft request + pending job metadata (server-only, stripped in getUpdateTag).
@@ -824,9 +890,11 @@ class CraftingCoreBlockEntity(
         if (pendingCount > 0) {
             output.putInt("pendingCount", pendingCount)
             val outsList = output.childrenList("pendingOutputs")
-            for ((id, ct) in pendingOutputs) {
+            for ((template, ct) in pendingOutputs) {
                 val child = outsList.addChild()
-                child.putString("id", id)
+                // Encode the template stack so the output resumes against its
+                // exact variant. Legacy "id"-string saves still read on load.
+                child.store("stack", net.minecraft.world.item.ItemStack.OPTIONAL_CODEC, template)
                 child.putLong("ct", ct)
             }
             val targetsList = output.childrenList("pendingPullTargets")
@@ -846,9 +914,9 @@ class CraftingCoreBlockEntity(
                 c.putInt("op", opId)
                 c.putString("api", info.processingApiName)
                 val outsList = c.childrenList("outputs")
-                for ((id, ct) in info.outputs) {
+                for ((template, ct) in info.outputs) {
                     val o = outsList.addChild()
-                    o.putString("id", id)
+                    o.store("stack", net.minecraft.world.item.ItemStack.OPTIONAL_CODEC, template)
                     o.putLong("ct", ct)
                 }
                 val tgtsList = c.childrenList("targets")
@@ -874,15 +942,19 @@ class CraftingCoreBlockEntity(
         }
         damien.nodeworks.network.NetworkSettingsRegistry.notifyConnectableChanged(networkId)
 
-        // Load buffer, new format first, legacy "buffer" + "bufferCapacity" format as fallback
-        // for pre-Phase-1 worlds. Both come through as CompoundTag sub-values via the codec.
+        // [level] isn't set yet during loadAdditional (Vanilla calls
+        // [setLevel] AFTER load), but [ValueInput.lookup] carries the
+        // registry context from the chunk-load path, which is what
+        // BufferState needs to deserialize component-bearing ItemStacks.
+        val registryAccess = input.lookup()
         val bufferStateTag = input.read("bufferState", CompoundTag.CODEC).orElse(null)
         if (bufferStateTag != null) {
-            bufferState.loadFromNBT(bufferStateTag)
+            bufferState.loadFromNBT(bufferStateTag, registryAccess)
         } else {
+            // Legacy "buffer" + "bufferCapacity" shape from older saves.
             val legacyBuffer = input.read("buffer", CompoundTag.CODEC).orElse(null)
             if (legacyBuffer != null) {
-                bufferState.loadFromNBT(legacyBuffer)
+                bufferState.loadFromNBT(legacyBuffer, registryAccess)
                 val legacyCap = input.getIntOrNull("bufferCapacity")
                 if (legacyCap != null) {
                     bufferState.setCapacities(legacyCap.toLong(), CpuRules.CORE_BASE_TYPES)
@@ -890,8 +962,9 @@ class CraftingCoreBlockEntity(
             }
         }
 
-        // Scheduler state, optional for pre-Phase-2 saves.
-        input.read("scheduler", CompoundTag.CODEC).ifPresent { scheduler.loadFromNBT(it) }
+        // Scheduler state, optional for pre-Phase-2 saves. [registryAccess]
+        // decodes Pull-op component patches into this session's hash space.
+        input.read("scheduler", CompoundTag.CODEC).ifPresent { scheduler.loadFromNBT(it, registryAccess) }
 
         // Load original craft request + pending job metadata
         originalCraftId = input.getStringOr("originalCraftId", "")
@@ -902,12 +975,22 @@ class CraftingCoreBlockEntity(
         pendingCount = input.getIntOr("pendingCount", 0)
         pendingOutputs = if (pendingCount > 0) {
             val list = input.childrenListOrEmpty("pendingOutputs")
-            val out = ArrayList<Pair<String, Long>>()
+            val out = ArrayList<Pair<net.minecraft.world.item.ItemStack, Long>>()
             for (child in list) {
-                val id = child.getStringOr("id", "")
-                if (id.isEmpty()) continue
                 val ct = child.getLongOr("ct", 0L)
-                out += id to ct
+                // Encoded stack first; legacy "id" string for old saves.
+                val stack = child.read("stack", net.minecraft.world.item.ItemStack.OPTIONAL_CODEC)
+                    .orElse(null)
+                    ?.takeIf { !it.isEmpty }
+                    ?: run {
+                        val id = child.getStringOr("id", "")
+                        if (id.isEmpty()) return@run null
+                        net.minecraft.resources.Identifier.tryParse(id)
+                            ?.let { net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(it) }
+                            ?.let { net.minecraft.world.item.ItemStack(it) }
+                    }
+                    ?: continue
+                out += stack to ct
             }
             out
         } else emptyList()
@@ -931,11 +1014,21 @@ class CraftingCoreBlockEntity(
             val opId = c.getIntOr("op", -1)
             if (opId < 0) continue
             val api = c.getStringOr("api", "")
-            val outputs = ArrayList<Pair<String, Long>>()
+            val outputs = ArrayList<Pair<net.minecraft.world.item.ItemStack, Long>>()
             for (o in c.childrenListOrEmpty("outputs")) {
-                val id = o.getStringOr("id", "")
-                if (id.isEmpty()) continue
-                outputs += id to o.getLongOr("ct", 0L)
+                val ct = o.getLongOr("ct", 0L)
+                val stack = o.read("stack", net.minecraft.world.item.ItemStack.OPTIONAL_CODEC)
+                    .orElse(null)
+                    ?.takeIf { !it.isEmpty }
+                    ?: run {
+                        val id = o.getStringOr("id", "")
+                        if (id.isEmpty()) return@run null
+                        net.minecraft.resources.Identifier.tryParse(id)
+                            ?.let { net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(it) }
+                            ?.let { net.minecraft.world.item.ItemStack(it) }
+                    }
+                    ?: continue
+                outputs += stack to ct
             }
             val targets = ArrayList<Pair<BlockPos, net.minecraft.core.Direction>>()
             for (t in c.childrenListOrEmpty("targets")) {

@@ -128,7 +128,8 @@ class InventoryTerminalScreen(
     data class QueueSlot(
         val id: Int, val itemId: String, val name: String,
         val totalRequested: Int, val readyCount: Int, val availableCount: Int,
-        val isComplete: Boolean
+        val isComplete: Boolean,
+        val componentsPatch: DataComponentPatch = DataComponentPatch.EMPTY,
     )
     var craftQueue: List<QueueSlot> = emptyList()
     private val MAX_PINNED get() = layout.cols
@@ -136,6 +137,7 @@ class InventoryTerminalScreen(
     // Craft dialogue state
     private var craftDialogueItemId: String? = null
     private var craftDialogueItemName: String = ""
+    private var craftDialogueComponentsPatch: DataComponentPatch = DataComponentPatch.EMPTY
     private var craftDialogueCount: String = "1"
     private var craftDialogueField: EditBox? = null
 
@@ -175,6 +177,16 @@ class InventoryTerminalScreen(
     private val slotDragVisited = mutableListOf<DragSlotRef>()  // dedup for non-shift drags
     private var slotDragLastHovered: DragSlotRef? = null         // slot-entry tracker for shift-drag
     private lateinit var searchBox: EditBox
+
+    /** Guard against ping-pong when adopting JEI's filter text into the local
+     *  search box. The [EditBox] responder mirrors back to JEI when sync is
+     *  on, this flag short-circuits the responder during JEI-driven updates. */
+    private var syncingFromJei: Boolean = false
+
+    /** Last text we observed in JEI's filter, used by the per-tick poll to
+     *  detect changes typed in JEI while the terminal is open. */
+    private var lastJeiSeenText: String = ""
+
     private var cachedNetworkColor: Int? = null
     private var itemStackCache = HashMap<String, ItemStack>()
     // Reused container for JEI hoveredSlot, avoids allocating new SimpleContainer every frame
@@ -279,7 +291,27 @@ class InventoryTerminalScreen(
         searchBox.setBordered(true)
         searchBox.setTextColor(0xFFE0E0E0.toInt())
         searchBox.setHint(Component.literal("Search items..."))
-        searchBox.setResponder { text -> repo.searchText = text }
+        searchBox.setResponder { text ->
+            repo.searchText = text
+            // Mirror to JEI when sync is on. Skip when the change originated
+            // from JEI itself, [syncingFromJei] is set just before we adopt
+            // JEI's text so the responder doesn't ping-pong back.
+            if (ClientConfig.invTerminalJeiSync && !syncingFromJei) {
+                val bridge = damien.nodeworks.integration.jei.JeiSearchBridge
+                if (bridge.read() != text) bridge.write(text)
+            }
+        }
+        // Adopt JEI's current filter text on screen (re)build so the grid opens
+        // already filtered to whatever the player typed in JEI.
+        if (ClientConfig.invTerminalJeiSync) {
+            damien.nodeworks.integration.jei.JeiSearchBridge.read()?.let { jeiText ->
+                if (jeiText.isNotEmpty() && jeiText != searchBox.value) {
+                    syncingFromJei = true
+                    searchBox.value = jeiText
+                    syncingFromJei = false
+                }
+            }
+        }
         if (ClientConfig.invTerminalAutoFocusSearch) {
             searchBox.isFocused = true
         }
@@ -369,6 +401,24 @@ class InventoryTerminalScreen(
             sideBtnX, sideBtnY, SIDE_BTN_W, SIDE_BTN_W, "", autoFocusIcon
         ) { _ ->
             ClientConfig.invTerminalAutoFocusSearch = !ClientConfig.invTerminalAutoFocusSearch
+            rebuildWidgets()
+        })
+        sideBtnY += SIDE_BTN_W + SIDE_BTN_GAP
+
+        // JEI search-bar sync toggle. When on, the terminal's search box and
+        // JEI's filter text mirror each other in both directions.
+        val jeiSyncIcon = if (ClientConfig.invTerminalJeiSync) Icons.JEI_SYNC_ON else Icons.JEI_SYNC_OFF
+        addRenderableWidget(SlicedButton.create(
+            sideBtnX, sideBtnY, SIDE_BTN_W, SIDE_BTN_W, "", jeiSyncIcon
+        ) { _ ->
+            ClientConfig.invTerminalJeiSync = !ClientConfig.invTerminalJeiSync
+            // Turning sync on: adopt JEI's current text immediately so the
+            // grid reflects whatever the player had typed before opening.
+            if (ClientConfig.invTerminalJeiSync) {
+                damien.nodeworks.integration.jei.JeiSearchBridge.read()?.let { jeiText ->
+                    if (jeiText != searchBox.value) searchBox.value = jeiText
+                }
+            }
             rebuildWidgets()
         })
 
@@ -562,6 +612,25 @@ class InventoryTerminalScreen(
     }
 
     override fun extractRenderState(graphics: GuiGraphicsExtractor, mouseX: Int, mouseY: Int, partialTick: Float) {
+        // JEI search-bar sync poll. When sync is on, pull JEI's current text
+        // each frame and adopt it locally if it changed externally (e.g. the
+        // player clicked JEI's input or used JEI's clear-search hotkey while
+        // the terminal was open). Local→JEI direction is handled by the
+        // [searchBox] responder. The [lastJeiSeenText] gate keeps this cheap:
+        // we only touch [searchBox.value] when JEI's text actually changed.
+        if (ClientConfig.invTerminalJeiSync) {
+            val bridge = damien.nodeworks.integration.jei.JeiSearchBridge
+            val jeiText = bridge.read()
+            if (jeiText != null && jeiText != lastJeiSeenText) {
+                lastJeiSeenText = jeiText
+                if (jeiText != searchBox.value) {
+                    syncingFromJei = true
+                    searchBox.value = jeiText
+                    syncingFromJei = false
+                }
+            }
+        }
+
         // Sync persisted auto-pull state to server on first render
         if (!syncedAutoPull) {
             syncedAutoPull = true
@@ -606,11 +675,14 @@ class InventoryTerminalScreen(
             graphics.pose().popMatrix()
         }
 
-        // Craft queue reserved row (always visible as first row)
+        // Craft queue reserved row (always visible as first row). The slot's
+        // [componentsPatch] surfaces the variant the player requested (potion
+        // type, dye color, enchantment) so a Potion-of-Strength job doesn't
+        // render as a bare "Uncraftable Potion".
         for ((i, slot) in craftQueue.withIndex()) {
             if (i >= layout.cols) break
             val sx = networkGrid.x + i * 18 + 1
-            val stack = getItemStack(slot.itemId)
+            val stack = getItemStack(slot.itemId, slot.componentsPatch)
             if (!stack.isEmpty) {
                 if (slot.availableCount <= 0) {
                     // Pending: gray overlay + dim item + queued count in gray (0.5x scale)
@@ -981,8 +1053,10 @@ class InventoryTerminalScreen(
             NineSlice.PANEL_INSET.draw(graphics, dx, dy, dw, dh)
             NineSlice.CONTENT_BORDER.draw(graphics, dx, dy, dw, dh)
 
-            // Item icon + name
-            val stack = getItemStack(craftDialogueItemId!!)
+            // Item icon + name. Use the component-aware overload so the
+            // dialogue surfaces the actual variant (e.g. "Potion of Strength")
+            // captured when the phantom row was Alt-clicked.
+            val stack = getItemStack(craftDialogueItemId!!, craftDialogueComponentsPatch)
             if (!stack.isEmpty) {
                 graphics.renderItem(stack, dx + 6, dy + 6)
             }
@@ -1102,7 +1176,7 @@ class InventoryTerminalScreen(
                     lastAttemptItemName = craftDialogueItemName
                     lastAttemptCount = count
                     PlatformServices.clientNetworking.sendToServer(
-                        damien.nodeworks.network.InvTerminalCraftPayload(menu.containerId, craftDialogueItemId!!, count)
+                        damien.nodeworks.network.InvTerminalCraftPayload(menu.containerId, craftDialogueItemId!!, count, craftDialogueComponentsPatch)
                     )
                     craftCloseAfterMs = System.currentTimeMillis() + CRAFT_CLOSE_DELAY_MS
                 }
@@ -1277,6 +1351,10 @@ class InventoryTerminalScreen(
             if (entry != null && entry.info.isCraftable && (hasAltDownCompat() || entry.info.count == 0L)) {
                 craftDialogueItemId = entry.info.itemId
                 craftDialogueItemName = entry.info.name
+                // Preserve the phantom's component patch so the dialogue icon
+                // renders the right potion / dyed armor / enchanted variant
+                // instead of a bare "Uncraftable Potion" placeholder.
+                craftDialogueComponentsPatch = entry.info.componentsPatch
                 craftDialogueField?.value = "1"
                 craftDialogueField?.visible = true
                 craftDialogueField?.isFocused = true
@@ -1305,8 +1383,11 @@ class InventoryTerminalScreen(
                     button == 1 -> 2
                     else -> 0
                 }
+                // Carry the clicked cell's components patch so a click on a
+                // Strength Potion entry extracts that variant rather than
+                // whichever potion the server-side itemId lookup finds first.
                 PlatformServices.clientNetworking.sendToServer(
-                    InvTerminalClickPayload(menu.containerId, entry.info.itemId, action)
+                    InvTerminalClickPayload(menu.containerId, entry.info.itemId, action, kind = 0, componentsPatch = entry.info.componentsPatch)
                 )
                 unfocusSearchBox()
                 return true
@@ -1511,7 +1592,7 @@ class InventoryTerminalScreen(
                 val count = craftDialogueField?.value?.toIntOrNull() ?: 1
                 if (count > 0) {
                     PlatformServices.clientNetworking.sendToServer(
-                        damien.nodeworks.network.InvTerminalCraftPayload(menu.containerId, craftDialogueItemId!!, count)
+                        damien.nodeworks.network.InvTerminalCraftPayload(menu.containerId, craftDialogueItemId!!, count, craftDialogueComponentsPatch)
                     )
                 }
                 craftDialogueItemId = null
@@ -1582,7 +1663,7 @@ class InventoryTerminalScreen(
             if (entry != null && !entry.isFluid && entry.info.count > 0) {
                 val action = if (dropStack) 6 else 5
                 PlatformServices.clientNetworking.sendToServer(
-                    InvTerminalClickPayload(menu.containerId, entry.info.itemId, action)
+                    InvTerminalClickPayload(menu.containerId, entry.info.itemId, action, kind = 0, componentsPatch = entry.info.componentsPatch)
                 )
                 return true
             }
@@ -1609,7 +1690,10 @@ class InventoryTerminalScreen(
     /** Handle server sync of craft queue state. */
     fun handleQueueSync(payload: damien.nodeworks.network.CraftQueueSyncPayload) {
         craftQueue = payload.entries.map { e ->
-            QueueSlot(e.id, e.itemId, e.name, e.totalRequested, e.readyCount, e.availableCount, e.isComplete)
+            QueueSlot(
+                e.id, e.itemId, e.name, e.totalRequested, e.readyCount, e.availableCount, e.isComplete,
+                componentsPatch = e.componentsPatch,
+            )
         }
     }
 
@@ -1729,6 +1813,9 @@ class InventoryTerminalScreen(
             }}")
             4 -> Component.literal(
                 "Auto-focus search: ${if (ClientConfig.invTerminalAutoFocusSearch) "On" else "Off"}"
+            )
+            5 -> Component.literal(
+                "JEI search sync: ${if (ClientConfig.invTerminalJeiSync) "On" else "Off"}"
             )
             else -> null
         }

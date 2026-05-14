@@ -31,6 +31,29 @@ object CraftTreeBuilder {
          *  "use the Instruction Set's stored recipe verbatim", which is also
          *  the default for substitution-disabled patterns. */
         val resolvedRecipe: List<String>? = null,
+        /** Component patch identifying the requested variant. Empty for
+         *  plain items (the common case). Carries through to the planner so
+         *  Pull ops can filter storage by component, e.g. asking specifically
+         *  for a Strength Potion rather than "any potion".
+         *
+         *  Nullable for the default value to avoid eagerly loading
+         *  [net.minecraft.core.component.DataComponentPatch] when a
+         *  [CraftTreeNode] is constructed without specifying a patch (which
+         *  is what the unit tests in `:common` do, since their runtime
+         *  classpath is MC-free). Read sites should fall back to
+         *  [net.minecraft.core.component.DataComponentPatch.EMPTY] when
+         *  null. */
+        val componentsPatch: net.minecraft.core.component.DataComponentPatch? = null,
+        /** Component-aware buffer key (itemId + componentsHash). Convenience
+         *  accessor for the planner's variant-keyed aggregation. The default
+         *  expression branches on [componentsPatch] being null to avoid
+         *  loading MC classes when no patch was supplied (test contexts). */
+        val bufferKey: damien.nodeworks.script.BufferKey.Key =
+            damien.nodeworks.script.BufferKey.Key(
+                itemId,
+                if (componentsPatch == null) ""
+                else damien.nodeworks.script.BufferKey.componentsHash(componentsPatch),
+            ),
     ) {
         /** Stable identity within this tree, assigned by [assignNodeIds] after construction
          *  and serialized so the client can match server-side op activity to specific nodes
@@ -57,10 +80,16 @@ object CraftTreeBuilder {
         level: ServerLevel,
         snapshot: NetworkSnapshot,
         depth: Int = 0,
-        visited: MutableSet<String> = mutableSetOf(),
-        reserved: MutableMap<String, Int> = mutableMapOf()
+        visited: MutableSet<damien.nodeworks.script.BufferKey.Key> = mutableSetOf(),
+        reserved: MutableMap<String, Int> = mutableMapOf(),
+        /** Component patch of the top-level requested variant. Empty for
+         *  plain crafts (the common case). Used by the recipe lookup so
+         *  multiple Processing Set recipes producing the same base item
+         *  (different potion types all output `minecraft:potion`) can be
+         *  disambiguated. */
+        componentsPatch: net.minecraft.core.component.DataComponentPatch = net.minecraft.core.component.DataComponentPatch.EMPTY,
     ): CraftTreeNode {
-        val node = buildInternal(itemId, count, level, snapshot, depth, visited, reserved)
+        val node = buildInternal(itemId, count, level, snapshot, depth, visited, reserved, componentsPatch)
         if (depth == 0) assignNodeIds(node)
         return node
     }
@@ -71,23 +100,30 @@ object CraftTreeBuilder {
         level: ServerLevel,
         snapshot: NetworkSnapshot,
         depth: Int,
-        visited: MutableSet<String>,
-        reserved: MutableMap<String, Int>
+        visited: MutableSet<damien.nodeworks.script.BufferKey.Key>,
+        reserved: MutableMap<String, Int>,
+        componentsPatch: net.minecraft.core.component.DataComponentPatch = net.minecraft.core.component.DataComponentPatch.EMPTY,
     ): CraftTreeNode {
         if (depth > 20) {
-            return CraftTreeNode(itemId, getItemName(itemId), count, "missing", "", "recursion limit", 0, emptyList())
+            return CraftTreeNode(itemId, getItemName(itemId, componentsPatch), count, "missing", "", "recursion limit", 0, emptyList(), componentsPatch = componentsPatch)
         }
 
-        val itemName = getItemName(itemId)
+        val itemName = getItemName(itemId, componentsPatch)
         val inStorageTotal = NetworkStorageHelper.countItems(level, snapshot, itemId).toInt()
         val reservedAmount = reserved[itemId] ?: 0
         val availableFromStorage = maxOf(0, inStorageTotal - reservedAmount)
 
-        // Prevent infinite loops for circular recipes
-        if (itemId in visited) {
-            return CraftTreeNode(itemId, itemName, count, "storage", "", "circular", availableFromStorage, emptyList())
+        // Prevent infinite loops for circular recipes. Key by (itemId,
+        // componentsHash) so a potion-processing chain where one variant
+        // crafts another (Strength <- Awkward) isn't flagged circular just
+        // because they share `minecraft:potion`.
+        val variantKey = damien.nodeworks.script.BufferKey.Key(
+            itemId, damien.nodeworks.script.BufferKey.componentsHash(componentsPatch),
+        )
+        if (variantKey in visited) {
+            return CraftTreeNode(itemId, itemName, count, "storage", "", "circular", availableFromStorage, emptyList(), componentsPatch = componentsPatch)
         }
-        visited.add(itemId)
+        visited.add(variantKey)
 
         // 1. Try Instruction Set (3x3 crafting)
         val instructionMatch = snapshot.findInstructionSet(itemId)
@@ -120,15 +156,30 @@ object CraftTreeBuilder {
                 resolveIngredient(ingId, ingCount * batches, level, snapshot, depth, visited, reserved)
             }
 
-            visited.remove(itemId)
+            visited.remove(variantKey)
             return CraftTreeNode(
                 itemId, itemName, actualCount, "craft_template", alias, "", availableFromStorage, children,
                 resolvedRecipe = if (swapped) concreteRecipe else null,
+                componentsPatch = componentsPatch,
             )
         }
 
-        // 2. Try Processing Set
-        val apiMatch = snapshot.findProcessingApi(itemId)
+        // 2. Try Processing Set. When the request carries a component patch
+        //    use the component-aware lookup so a Strength-potion request
+        //    doesn't get routed to the Fire-resistance recipe. When multiple
+        //    recipes produce the same variant (e.g. raw_iron → strength and
+        //    awkward_potion → strength both on the network), pick the one
+        //    whose handler is bound AND whose inputs are reachable. The
+        //    naive "first match" routinely picked an unhandled or
+        //    unsatisfiable recipe and surfaced confusing errors.
+        val apiMatch = if (componentsPatch.size() > 0) {
+            pickBestRecipe(
+                snapshot.findAllProcessingApisByOutput(itemId, componentsPatch),
+                level, snapshot,
+            )
+        } else {
+            snapshot.findProcessingApi(itemId)
+        }
         if (apiMatch != null) {
             val api = apiMatch.api
             val isSubnet = apiMatch.apiStorage.remoteTerminalPositions != null
@@ -155,29 +206,54 @@ object CraftTreeBuilder {
 
             // Processing APIs can yield >1 per batch (e.g. a smelting handler that produces
             // 9 nuggets per ingot). Round request up to a whole batch, same as Instruction Sets.
-            val perBatch = api.outputs.firstOrNull { it.first == itemId }?.second?.coerceAtLeast(1) ?: 1
+            val matchingOutput = api.outputs.firstOrNull { it.itemId == itemId }
+            val perBatch = matchingOutput?.count?.coerceAtLeast(1) ?: 1
             val batches = (count + perBatch - 1) / perBatch
             val actualCount = batches * perBatch
 
-            val children = api.inputs.flatMap { (ingId, ingCount) ->
-                resolveIngredient(ingId, ingCount * batches, level, snapshot, depth, visited, reserved)
+            val children = api.inputs.flatMap { ingr ->
+                // Pass through each ingredient's componentsPatch so the
+                // recursive resolveIngredient call (which generates Pull op
+                // sources) can ask for the specific variant. Without this, a
+                // recipe taking 1 Swiftness + 1 Fire Resistance would aggregate
+                // both as "2 minecraft:potion" and pull two random potions.
+                resolveIngredient(
+                    ingr.itemId, ingr.count * batches, level, snapshot, depth, visited, reserved,
+                    ingredientPatch = ingr.stack.componentsPatch,
+                )
             }
 
+            // Prefer the caller's patch when supplied. Otherwise inherit the
+            // recipe's matching output patch so a request for plain
+            // "minecraft:potion" still shows the produced variant (e.g.
+            // Strength) on the tree root.
+            val rootPatch = if (componentsPatch.size() > 0) componentsPatch
+                else matchingOutput?.stack?.componentsPatch ?: net.minecraft.core.component.DataComponentPatch.EMPTY
+            val rootName = if (componentsPatch.size() > 0) itemName else getItemName(itemId, rootPatch)
             val source = if (hasHandler) "process_template" else "process_no_handler"
-            visited.remove(itemId)
-            return CraftTreeNode(itemId, itemName, actualCount, source, api.name, resolvedBy, availableFromStorage, children)
+            visited.remove(variantKey)
+            return CraftTreeNode(
+                itemId, rootName, actualCount, source, api.name, resolvedBy, availableFromStorage, children,
+                componentsPatch = rootPatch,
+            )
         }
 
         // 3. Fall back to storage, but only for the portion that isn't already reserved
         if (availableFromStorage >= count) {
             reserved[itemId] = reservedAmount + count
-            visited.remove(itemId)
-            return CraftTreeNode(itemId, itemName, count, "storage", "", "storage", availableFromStorage, emptyList())
+            visited.remove(variantKey)
+            return CraftTreeNode(
+                itemId, itemName, count, "storage", "", "storage", availableFromStorage, emptyList(),
+                componentsPatch = componentsPatch,
+            )
         }
 
         // 4. No recipe and no (unreserved) storage, genuinely missing
-        visited.remove(itemId)
-        return CraftTreeNode(itemId, itemName, count, "missing", "", "", availableFromStorage, emptyList())
+        visited.remove(variantKey)
+        return CraftTreeNode(
+            itemId, itemName, count, "missing", "", "", availableFromStorage, emptyList(),
+            componentsPatch = componentsPatch,
+        )
     }
 
     /**
@@ -191,27 +267,105 @@ object CraftTreeBuilder {
         level: ServerLevel,
         snapshot: NetworkSnapshot,
         depth: Int,
-        visited: MutableSet<String>,
-        reserved: MutableMap<String, Int>
+        visited: MutableSet<damien.nodeworks.script.BufferKey.Key>,
+        reserved: MutableMap<String, Int>,
+        /** Component patch the ingredient declares. Empty = match any variant
+         *  by itemId only (the plain-recipe path).
+         *  When non-empty, the storage count and the reservation tracker key
+         *  on the full [BufferKey.Key] so two ingredient slots demanding
+         *  different variants of the same itemId (e.g. swiftness + fire-res
+         *  potion) don't double-count or double-reserve the same storage items. */
+        ingredientPatch: net.minecraft.core.component.DataComponentPatch = net.minecraft.core.component.DataComponentPatch.EMPTY,
     ): List<CraftTreeNode> {
-        val ingInStorage = NetworkStorageHelper.countItems(level, snapshot, ingId).toInt()
-        val ingReserved = reserved[ingId] ?: 0
+        val componentsHash = damien.nodeworks.script.BufferKey.componentsHash(ingredientPatch)
+        // Reservation key embeds the components hash so different variants of
+        // one itemId carve independent reservation buckets. Plain ingredients
+        // (empty hash) keep the old `itemId` key so existing reservation
+        // counts roll forward without migration.
+        val reservedKey = if (componentsHash.isEmpty()) ingId else "$ingId#$componentsHash"
+        val ingInStorage = if (componentsHash.isEmpty()) {
+            NetworkStorageHelper.countItems(level, snapshot, ingId).toInt()
+        } else {
+            NetworkStorageHelper.countVariantAcrossNetwork(level, snapshot, ingId, ingredientPatch).toInt()
+        }
+        val ingReserved = reserved[reservedKey] ?: 0
         val ingAvailable = maxOf(0, ingInStorage - ingReserved)
 
         return when {
             ingAvailable >= needed -> {
-                reserved[ingId] = ingReserved + needed
-                listOf(CraftTreeNode(ingId, getItemName(ingId), needed, "storage", "", "storage", ingAvailable, emptyList()))
+                reserved[reservedKey] = ingReserved + needed
+                listOf(CraftTreeNode(
+                    ingId, getItemName(ingId, ingredientPatch), needed, "storage", "", "storage", ingAvailable, emptyList(),
+                    componentsPatch = ingredientPatch,
+                ))
             }
             ingAvailable > 0 -> {
-                reserved[ingId] = ingReserved + ingAvailable
-                val fromStorage = CraftTreeNode(ingId, getItemName(ingId), ingAvailable, "storage", "", "storage", ingAvailable, emptyList())
+                reserved[reservedKey] = ingReserved + ingAvailable
+                val fromStorage = CraftTreeNode(
+                    ingId, getItemName(ingId, ingredientPatch), ingAvailable, "storage", "", "storage", ingAvailable, emptyList(),
+                    componentsPatch = ingredientPatch,
+                )
                 val toCraft = needed - ingAvailable
-                val crafted = buildInternal(ingId, toCraft, level, snapshot, depth + 1, visited, reserved)
+                val crafted = buildInternal(
+                    ingId, toCraft, level, snapshot, depth + 1, visited, reserved, ingredientPatch,
+                )
                 listOf(fromStorage, crafted)
             }
-            else -> listOf(buildInternal(ingId, needed, level, snapshot, depth + 1, visited, reserved))
+            else -> listOf(buildInternal(
+                ingId, needed, level, snapshot, depth + 1, visited, reserved, ingredientPatch,
+            ))
         }
+    }
+
+    /** Rank competing recipes that all produce the same requested variant.
+     *  Returns the best candidate, or null if [candidates] is empty.
+     *
+     *  Score (higher is better):
+     *   - +10 if a handler is bound for this recipe on its hosting network
+     *   - +1  per recipe input that storage can supply
+     *
+     *  Ties are broken by network walk order (first match wins). This avoids
+     *  the "two recipes both produce strength potion, planner picks the
+     *  unhandled or unsatisfiable one and surfaces a confusing missing-input
+     *  / missing-handler error" failure mode. When all candidates are
+     *  equally bad, returns the first so the resulting error message is at
+     *  least deterministic. */
+    private fun pickBestRecipe(
+        candidates: List<damien.nodeworks.network.ProcessingApiMatch>,
+        level: ServerLevel,
+        snapshot: NetworkSnapshot,
+    ): damien.nodeworks.network.ProcessingApiMatch? {
+        if (candidates.isEmpty()) return null
+        if (candidates.size == 1) return candidates[0]
+        var best: damien.nodeworks.network.ProcessingApiMatch? = null
+        var bestScore = Int.MIN_VALUE
+        for (match in candidates) {
+            val api = match.api
+            val isSubnet = match.apiStorage.remoteTerminalPositions != null
+            val handlerNetworkId = if (isSubnet) match.apiStorage.remoteNetworkId else snapshot.networkId
+            val hasLuaHandler = PlatformServices.modState.findProcessingEngine(
+                level,
+                match.apiStorage.remoteTerminalPositions ?: snapshot.terminalPositions,
+                api.name,
+                match.apiStorage.remoteDimension,
+            ) != null
+            val hasBlockHandler = damien.nodeworks.script.cpu.BlockHandlerRegistry.find(handlerNetworkId, api.name) != null
+            var score = 0
+            if (hasLuaHandler || hasBlockHandler) score += 10
+            for (ingr in api.inputs) {
+                val available = if (ingr.componentsHash.isEmpty()) {
+                    NetworkStorageHelper.countItems(level, snapshot, ingr.itemId)
+                } else {
+                    NetworkStorageHelper.countVariantAcrossNetwork(level, snapshot, ingr.itemId, ingr.stack.componentsPatch)
+                }
+                if (available >= ingr.count.toLong()) score += 1
+            }
+            if (score > bestScore) {
+                bestScore = score
+                best = match
+            }
+        }
+        return best ?: candidates.first()
     }
 
     /** Find the network name of the subnet that a broadcast antenna belongs to. */
@@ -342,9 +496,15 @@ object CraftTreeBuilder {
         return if (result.isEmpty) 1 else result.getCount()
     }
 
-    private fun getItemName(itemId: String): String {
+    private fun getItemName(
+        itemId: String,
+        componentsPatch: net.minecraft.core.component.DataComponentPatch = net.minecraft.core.component.DataComponentPatch.EMPTY,
+    ): String {
         val id = Identifier.tryParse(itemId) ?: return itemId.substringAfter(':')
         val item = BuiltInRegistries.ITEM.getValue(id) ?: return itemId.substringAfter(':')
-        return ItemStack(item).hoverName.string
+        val stack = ItemStack(item).apply {
+            if (componentsPatch.size() > 0) applyComponents(componentsPatch)
+        }
+        return stack.hoverName.string
     }
 }
