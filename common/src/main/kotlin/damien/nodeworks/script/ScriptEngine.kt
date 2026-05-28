@@ -1847,6 +1847,223 @@ class ScriptEngine(
             onLimit = LuaValue.valueOf(0),
         ))
 
+        fun buildCraftBuilder(
+            rawIdentifier: String,
+            count: Int,
+            suppressPlanFailureLog: Boolean = false,
+        ): LuaValue {
+            // Parse so `network:craft("minecraft:potion[minecraft:potion_contents={...}]")`
+            // resolves to (itemId, componentsPatch) and the planner can target
+            // the specific variant. Plain ids pass through unchanged.
+            val registries = level.registryAccess()
+            val parsedRule = FilterRule.parse(rawIdentifier, registries)
+            val (identifier, requestedPatch) = if (parsedRule is FilterRule.Item) {
+                parsedRule.itemId to (parsedRule.componentsPatch
+                    ?: net.minecraft.core.component.DataComponentPatch.EMPTY)
+            } else {
+                rawIdentifier to net.minecraft.core.component.DataComponentPatch.EMPTY
+            }
+
+            val currentSnapshot = snapshot()
+            CraftingHelper.currentPendingJob = null
+            // omitDeliver = true: the CPU plan stops at the root output, leaving
+            // the freshly-produced items in the buffer. The runtime then either
+            // hands them to a `:connect(fn)` callback or runs the auto-store path
+            // (which uses [releaseCraftResult] and drops any overflow in-world).
+            val result = CraftingHelper.craft(
+                identifier, count, level, currentSnapshot,
+                cache = inventoryCache,
+                processingHandlers = processingHandlers.takeIf { it.isNotEmpty() },
+                callerScheduler = scheduler,
+                traceLog = { msg -> logCallback(msg, false) },
+                omitDeliver = true,
+                componentsPatch = requestedPatch,
+            )
+
+            // Check for async pending job (processing handler or async assembly)
+            val pending = CraftingHelper.currentPendingJob
+            CraftingHelper.currentPendingJob = null
+
+            val planFailed = result == null && pending == null
+            if (planFailed && !suppressPlanFailureLog) {
+                // Surface the reason now so the player sees it even if their script
+                // never registers a `:connect` callback. The builder still resolves
+                // to a "failed" outcome on the next tick so any registered callback
+                // is invoked uniformly.
+                CraftingHelper.lastFailReason?.let { logCallback(it, true) }
+            }
+
+            // For async: result is null but pending is set. Build a CraftResult placeholder
+            // so the per-completion buffer release has somewhere to point. Plan failures
+            // skip this entirely, there's nothing to release.
+            val craftResult: CraftingHelper.CraftResult? = if (planFailed) null else result ?: run {
+                val id = net.minecraft.resources.Identifier.tryParse(identifier)
+                val item = if (id != null) net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(id) else null
+                val name = if (item != null) net.minecraft.world.item.ItemStack(item).hoverName.string else identifier
+                CraftingHelper.CraftResult(
+                    identifier,
+                    name,
+                    count,
+                    cpu = currentSnapshot.cpus.firstOrNull()?.let {
+                        level.getBlockEntity(it.pos) as? damien.nodeworks.block.entity.CraftingCoreBlockEntity
+                    },
+                    level = level,
+                    snapshot = currentSnapshot,
+                    cache = inventoryCache,
+                )
+            }
+
+            // Auto-store path: release CPU buffer → storage. Used when no `:connect`
+            // handler was registered. Items routed via the standard storage-card
+            // priority + route table, with the existing in-world drop fallback when
+            // storage is full (handled by `releaseCraftResult`'s downstream path).
+            fun autoStoreToNetwork() {
+                val cr = craftResult ?: return
+                CraftingHelper.releaseCraftResult(cr)
+            }
+
+            /** Build the buffer-backed [ItemsHandle] passed to a `:connect` callback.
+             *  Items remain in the CPU buffer until the callback drains them via
+             *  `card:insert` / `network:insert`. After the callback returns, anything
+             *  still in the buffer is dropped in-world (see [dropRemainingBuffer]). */
+            fun createBufferHandle(cr: CraftingHelper.CraftResult): LuaValue {
+                val cpu = cr.cpu ?: return LuaValue.NIL
+                val id = net.minecraft.resources.Identifier.tryParse(cr.outputItemId)
+                val item = if (id != null) net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(id) else null
+                val maxStack = item?.getDefaultMaxStackSize() ?: 64
+                return ItemsHandle.toLuaTable(
+                    ItemsHandle(
+                        itemId = cr.outputItemId,
+                        itemName = cr.outputName,
+                        count = cr.count,
+                        maxStackSize = maxStack,
+                        hasData = false,
+                        filter = cr.outputItemId,
+                        sourceStorage = { null },
+                        level = level,
+                        bufferSource = damien.nodeworks.script.BufferSource.ofItemId(cpu, cr.outputItemId, cr.count.toLong()),
+                    )
+                )
+            }
+
+            /** Post-callback cleanup: anything the user's handler didn't drain from
+             *  the CPU buffer is dropped at the CPU's position and an error is
+             *  surfaced through [CraftingCoreBlockEntity.lastFailureReason] (the same
+             *  channel storage-full Deliver-op failures already use, so the CPU's
+             *  GUI shows the red banner and the script terminal sees the message
+             *  via the standard CPU error path). The contract is "you took the
+             *  handle, you're responsible for moving the items." Failing to do so
+             *  isn't silent. */
+            fun dropRemainingBuffer(cr: CraftingHelper.CraftResult) {
+                val cpu = cr.cpu ?: return
+                val remaining = cpu.getBufferCount(cr.outputItemId)
+                if (remaining <= 0L) {
+                    if (cpu.isCrafting) {
+                        cpu.clearAllCraftState()
+                        cpu.setCrafting(false)
+                    }
+                    return
+                }
+                val id = net.minecraft.resources.Identifier.tryParse(cr.outputItemId)
+                val item = if (id != null) net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(id) else null
+                if (item != null) {
+                    val maxStack = item.getDefaultMaxStackSize().toLong()
+                    var stillRemaining = remaining
+                    while (stillRemaining > 0L) {
+                        val batch = minOf(stillRemaining, maxStack).toInt()
+                        val stack = net.minecraft.world.item.ItemStack(item, batch)
+                        net.minecraft.world.Containers.dropItemStack(
+                            level,
+                            cpu.blockPos.x + 0.5,
+                            cpu.blockPos.y + 1.0,
+                            cpu.blockPos.z + 0.5,
+                            stack
+                        )
+                        cpu.removeFromBuffer(cr.outputItemId, batch.toLong())
+                        stillRemaining -= batch.toLong()
+                    }
+                }
+                val displayName = cr.outputName.ifEmpty { cr.outputItemId }
+                cpu.lastFailureReason =
+                    "Craft callback didn't move all items, dropped $remaining × $displayName at the CPU"
+                if (cpu.isCrafting) {
+                    cpu.clearAllCraftState()
+                    cpu.setCrafting(false)
+                }
+            }
+
+            // Mutable resolution state. The handler is registered (or not) by the
+            // user's `:connect(fn)` call. The `resolved` guard prevents double-fire
+            // when an async pending job's onCompleteCallback races against any
+            // future cleanup paths.
+            var handler: LuaFunction? = null
+            var resolved = false
+
+            fun fireHandler(handle: LuaValue) {
+                val fn = handler ?: return
+                try {
+                    fn.call(handle)
+                } catch (e: LuaError) {
+                    logCallback("craft callback error: ${gate.stripLuaTraceback(e.message)}", true)
+                }
+            }
+
+            fun resolve(success: Boolean) {
+                if (resolved) return
+                resolved = true
+                val cr = craftResult
+                if (success && cr != null) {
+                    if (handler != null) {
+                        // Hand the handler a buffer-backed view of the result. Items
+                        // stay in the CPU buffer until the handler drains them. Anything
+                        // left over after the call returns is dropped in-world.
+                        fireHandler(createBufferHandle(cr))
+                        dropRemainingBuffer(cr)
+                    } else {
+                        // Default: route into network storage. Storage-full overflow
+                        // is handled downstream of releaseCraftResult.
+                        autoStoreToNetwork()
+                    }
+                } else {
+                    // Failure path: any partial buffer is released to storage so the
+                    // items aren't stranded, then the handler (if any) is invoked
+                    // with nil so scripts can branch on outcome.
+                    cr?.let { CraftingHelper.releaseCraftResult(it) }
+                    if (handler != null) fireHandler(LuaValue.NIL)
+                }
+            }
+
+            // Schedule the resolution. The `:connect(fn)` chain runs synchronously
+            // immediately after `network:craft` returns, so we defer the resolve by
+            // one tick to give it a chance to register before we fire.
+            //
+            //   * No pending (plan failure): runOnce(0), resolve with !planFailed.
+            //   * Pending already complete (instant sync craft): runOnce(0), pick
+            //     up the recorded success flag from the pending job.
+            //   * Pending in-flight: hook the completion callback. Resolution
+            //     happens whenever the scheduler finishes the plan.
+            when {
+                pending == null -> scheduler.runOnce(0) { resolve(success = !planFailed) }
+                pending.isComplete -> {
+                    val capturedSuccess = pending.success
+                    scheduler.runOnce(0) { resolve(capturedSuccess) }
+                }
+                else -> pending.onCompleteCallback = { success -> resolve(success) }
+            }
+
+            // The builder. Only `:connect(fn)` is exposed, the previous `:store()`
+            // method went away because auto-store is now the unconfigured default.
+            val builder = LuaTable()
+            builder.set("connect", object : TwoArgFunction() {
+                override fun call(selfArg: LuaValue, callbackArg: LuaValue): LuaValue {
+                    handler = callbackArg.checkfunction()
+                    return LuaValue.NIL
+                }
+            })
+
+            return builder
+        }
+
         // network:craft(identifier, count?) → CraftBuilder.
         //
         // The builder always returns non-nil so scripts don't have to nil-check the
@@ -1859,204 +2076,85 @@ class ScriptEngine(
             override fun invoke(args: Varargs): Varargs {
                 val rawIdentifier = args.checkjstring(2)
                 val count = if (args.narg() >= 3 && !args.arg(3).isnil()) args.checkint(3) else 1
+                return buildCraftBuilder(rawIdentifier, count)
+            }
+        })
 
-                // Parse so `network:craft("minecraft:potion[minecraft:potion_contents={...}]")`
-                // resolves to (itemId, componentsPatch) and the planner can target
-                // the specific variant. Plain ids pass through unchanged.
+        networkTable.setGuarded("Network", "tryCraft", object: VarArgFunction() {
+            override fun invoke(args: Varargs): Varargs {
+                val rawIdentifier = args.checkjstring(2)
+                val countArg = args.arg(3)
+                val acceptedArg = args.arg(4)
+
+                val requestedCount = when {
+                    countArg.isnil() -> 1
+                    countArg.isnumber() -> countArg.toint()
+                    countArg.isfunction() -> 1
+                    else -> throw LuaError("tryCraft count must be a number")
+                }
+
+                val acceptedHandler = when {
+                    acceptedArg.isfunction() -> acceptedArg.checkfunction()
+                    acceptedArg.isnil() && countArg.isfunction() -> countArg.checkfunction()
+                    acceptedArg.isnil() -> null
+                    else -> throw LuaError("tryCraft accepted-count handler must be a function")
+                }
+
                 val registries = level.registryAccess()
                 val parsedRule = FilterRule.parse(rawIdentifier, registries)
-                val (identifier, requestedPatch) = when (parsedRule) {
-                    is FilterRule.Item -> parsedRule.itemId to (parsedRule.componentsPatch
+                val (identifier, requestedPatch) = if (parsedRule is FilterRule.Item) {
+                    parsedRule.itemId to (parsedRule.componentsPatch
                         ?: net.minecraft.core.component.DataComponentPatch.EMPTY)
-                    else -> rawIdentifier to net.minecraft.core.component.DataComponentPatch.EMPTY
+                } else {
+                    rawIdentifier to net.minecraft.core.component.DataComponentPatch.EMPTY
                 }
+                val currentSnapshot = snapshot()
 
-                CraftingHelper.currentPendingJob = null
-                // omitDeliver = true: the CPU plan stops at the root output, leaving
-                // the freshly-produced items in the buffer. The runtime then either
-                // hands them to a `:connect(fn)` callback or runs the auto-store path
-                // (which uses [releaseCraftResult] and drops any overflow in-world).
-                val result = CraftingHelper.craft(
-                    identifier, count, level, snapshot(),
-                    cache = inventoryCache,
-                    processingHandlers = processingHandlers.takeIf { it.isNotEmpty() },
-                    callerScheduler = scheduler,
-                    traceLog = { msg -> logCallback(msg, false) },
-                    omitDeliver = true,
-                    componentsPatch = requestedPatch,
-                )
+                data class TryCraftProbe(val requested: Int, val accepted: Int)
 
-                // Check for async pending job (processing handler or async assembly)
-                val pending = CraftingHelper.currentPendingJob
-                CraftingHelper.currentPendingJob = null
-
-                val planFailed = result == null && pending == null
-                if (planFailed) {
-                    // Surface the reason now so the player sees it even if their script
-                    // never registers a `:connect` callback. The builder still resolves
-                    // to a "failed" outcome on the next tick so any registered callback
-                    // is invoked uniformly.
-                    CraftingHelper.lastFailReason?.let { logCallback(it, true) }
-                }
-
-                // For async: result is null but pending is set. Build a CraftResult placeholder
-                // so the per-completion buffer release has somewhere to point. Plan failures
-                // skip this entirely, there's nothing to release.
-                val craftResult: CraftingHelper.CraftResult? = if (planFailed) null else result ?: run {
-                    val id = net.minecraft.resources.Identifier.tryParse(identifier)
-                    val item = if (id != null) net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(id) else null
-                    val name = if (item != null) net.minecraft.world.item.ItemStack(item).hoverName.string else identifier
-                    CraftingHelper.CraftResult(identifier, name, count,
-                        cpu = snapshot().cpus.firstOrNull()?.let { level.getBlockEntity(it.pos) as? damien.nodeworks.block.entity.CraftingCoreBlockEntity },
-                        level = level, snapshot = snapshot(), cache = inventoryCache)
-                }
-
-                // Auto-store path: release CPU buffer → storage. Used when no `:connect`
-                // handler was registered. Items routed via the standard storage-card
-                // priority + route table, with the existing in-world drop fallback when
-                // storage is full (handled by `releaseCraftResult`'s downstream path).
-                fun autoStoreToNetwork() {
-                    val cr = craftResult ?: return
-                    CraftingHelper.releaseCraftResult(cr)
-                }
-
-                /** Build the buffer-backed [ItemsHandle] passed to a `:connect` callback.
-                 *  Items remain in the CPU buffer until the callback drains them via
-                 *  `card:insert` / `network:insert`. After the callback returns, anything
-                 *  still in the buffer is dropped in-world (see [dropRemainingBuffer]). */
-                fun createBufferHandle(cr: CraftingHelper.CraftResult): LuaValue {
-                    val cpu = cr.cpu ?: return LuaValue.NIL
-                    val id = net.minecraft.resources.Identifier.tryParse(cr.outputItemId)
-                    val item = if (id != null) net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(id) else null
-                    val maxStack = item?.getDefaultMaxStackSize() ?: 64
-                    return ItemsHandle.toLuaTable(
-                        ItemsHandle(
-                            itemId = cr.outputItemId,
-                            itemName = cr.outputName,
-                            count = cr.count,
-                            maxStackSize = maxStack,
-                            hasData = false,
-                            filter = cr.outputItemId,
-                            sourceStorage = { null },
-                            level = level,
-                            bufferSource = damien.nodeworks.script.BufferSource.ofItemId(cpu, cr.outputItemId, cr.count.toLong()),
-                        )
+                fun probe(count: Int): TryCraftProbe? {
+                    if (count <= 0) return null
+                    val tree = CraftTreeBuilder.buildCraftTree(
+                        identifier, count, level, currentSnapshot, componentsPatch = requestedPatch,
                     )
-                }
 
-                /** Post-callback cleanup: anything the user's handler didn't drain from
-                 *  the CPU buffer is dropped at the CPU's position and an error is
-                 *  surfaced through [CraftingCoreBlockEntity.lastFailureReason] (the same
-                 *  channel storage-full Deliver-op failures already use, so the CPU's
-                 *  GUI shows the red banner and the script terminal sees the message
-                 *  via the standard CPU error path). The contract is "you took the
-                 *  handle, you're responsible for moving the items." Failing to do so
-                 *  isn't silent. */
-                fun dropRemainingBuffer(cr: CraftingHelper.CraftResult) {
-                    val cpu = cr.cpu ?: return
-                    val remaining = cpu.getBufferCount(cr.outputItemId)
-                    if (remaining <= 0L) {
-                        if (cpu.isCrafting) {
-                            cpu.clearAllCraftState()
-                            cpu.setCrafting(false)
+                    val plan = damien.nodeworks.script.cpu.CraftPlanner
+                        .plan(tree, currentSnapshot, omitDeliver = true).plan ?: return null
+                    val hasIdleFeasibleCpu = currentSnapshot.cpus
+                        .sortedByDescending { it.bufferCapacity }
+                        .any { cpuSnap ->
+                            val cpu = level.getBlockEntity(cpuSnap.pos) as? damien.nodeworks.block.entity.CraftingCoreBlockEntity
+                                ?: return@any false
+                            cpu.isFormed
+                                && damien.nodeworks.script.cpu.CpuFeasibility.check(tree, cpu).ok
+                                && cpu.scheduler.isIdle
                         }
-                        return
-                    }
-                    val id = net.minecraft.resources.Identifier.tryParse(cr.outputItemId)
-                    val item = if (id != null) net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(id) else null
-                    if (item != null) {
-                        val maxStack = item.getDefaultMaxStackSize().toLong()
-                        var stillRemaining = remaining
-                        while (stillRemaining > 0L) {
-                            val batch = minOf(stillRemaining, maxStack).toInt()
-                            val stack = net.minecraft.world.item.ItemStack(item, batch)
-                            net.minecraft.world.Containers.dropItemStack(
-                                level,
-                                cpu.blockPos.x + 0.5,
-                                cpu.blockPos.y + 1.0,
-                                cpu.blockPos.z + 0.5,
-                                stack
-                            )
-                            cpu.removeFromBuffer(cr.outputItemId, batch.toLong())
-                            stillRemaining -= batch.toLong()
-                        }
-                    }
-                    val displayName = cr.outputName.ifEmpty { cr.outputItemId }
-                    cpu.lastFailureReason =
-                        "Craft callback didn't move all items, dropped $remaining × $displayName at the CPU"
-                    if (cpu.isCrafting) {
-                        cpu.clearAllCraftState()
-                        cpu.setCrafting(false)
-                    }
+                    if (!hasIdleFeasibleCpu || plan.ops.isEmpty()) return null
+                    return TryCraftProbe(count, tree.count)
                 }
 
-                // Mutable resolution state. The handler is registered (or not) by the
-                // user's `:connect(fn)` call. The `resolved` guard prevents double-fire
-                // when an async pending job's onCompleteCallback races against any
-                // future cleanup paths.
-                var handler: LuaFunction? = null
-                var resolved = false
-
-                fun fireHandler(handle: LuaValue) {
-                    val fn = handler ?: return
-                    try { fn.call(handle) }
-                    catch (e: LuaError) { logCallback("craft callback error: ${gate.stripLuaTraceback(e.message)}", true) }
-                }
-
-                fun resolve(success: Boolean) {
-                    if (resolved) return
-                    resolved = true
-                    val cr = craftResult
-                    if (success && cr != null) {
-                        if (handler != null) {
-                            // Hand the handler a buffer-backed view of the result. Items
-                            // stay in the CPU buffer until the handler drains them. Anything
-                            // left over after the call returns is dropped in-world.
-                            fireHandler(createBufferHandle(cr))
-                            dropRemainingBuffer(cr)
+                var acceptedProbe = probe(requestedCount)
+                if (acceptedProbe == null && requestedCount > 1) {
+                    var low = 1
+                    var high = requestedCount
+                    while (low <= high) {
+                        val mid = (low + high) ushr 1
+                        val candidate = probe(mid)
+                        if (candidate != null) {
+                            acceptedProbe = candidate
+                            low = mid + 1
                         } else {
-                            // Default: route into network storage. Storage-full overflow
-                            // is handled downstream of releaseCraftResult.
-                            autoStoreToNetwork()
+                            high = mid - 1
                         }
-                    } else {
-                        // Failure path: any partial buffer is released to storage so the
-                        // items aren't stranded, then the handler (if any) is invoked
-                        // with nil so scripts can branch on outcome.
-                        cr?.let { CraftingHelper.releaseCraftResult(it) }
-                        if (handler != null) fireHandler(LuaValue.NIL)
                     }
                 }
 
-                // Schedule the resolution. The `:connect(fn)` chain runs synchronously
-                // immediately after `network:craft` returns, so we defer the resolve by
-                // one tick to give it a chance to register before we fire.
-                //
-                //   * No pending (plan failure): runOnce(0), resolve with !planFailed.
-                //   * Pending already complete (instant sync craft): runOnce(0), pick
-                //     up the recorded success flag from the pending job.
-                //   * Pending in-flight: hook the completion callback. Resolution
-                //     happens whenever the scheduler finishes the plan.
-                when {
-                    pending == null -> scheduler.runOnce(0) { resolve(success = !planFailed) }
-                    pending.isComplete -> {
-                        val capturedSuccess = pending.success
-                        scheduler.runOnce(0) { resolve(capturedSuccess) }
-                    }
-                    else -> pending.onCompleteCallback = { success -> resolve(success) }
-                }
-
-                // The builder. Only `:connect(fn)` is exposed, the previous `:store()`
-                // method went away because auto-store is now the unconfigured default.
-                val builder = LuaTable()
-                builder.set("connect", object : TwoArgFunction() {
-                    override fun call(selfArg: LuaValue, callbackArg: LuaValue): LuaValue {
-                        handler = callbackArg.checkfunction()
-                        return LuaValue.NIL
-                    }
-                })
-
-                return builder
+                acceptedHandler?.call(LuaValue.valueOf(acceptedProbe?.accepted ?: 0))
+                return buildCraftBuilder(
+                    rawIdentifier,
+                    acceptedProbe?.requested ?: requestedCount,
+                    suppressPlanFailureLog = true,
+                )
             }
         })
 

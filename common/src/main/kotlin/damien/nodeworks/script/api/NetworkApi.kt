@@ -149,6 +149,23 @@ val NetworkApi: ApiSurface = api(Network) {
         guidebookRef = "nodeworks:lua-api/network.md#craft"
     }
 
+    method("tryCraft") {
+        param("itemId", Craftable, description = "Item the network can plan a recipe for.")
+        param("count", Number.optional(), description = "Optional requested count, defaults to 1.")
+        param(
+            "accepted",
+            function {
+                param("count", Number)
+                returns(Void)
+            }.optional(),
+            description = "Optional callback that receives the accepted output count before the craft is queued. Receives 0 when nothing can be accepted right now."
+        )
+        returns(CraftBuilder)
+        description =
+            "Best-effort variant of `network:craft`. Tries to queue as much of the requested craft as the network can accept right now, reports the accepted output count through the optional callback, and returns a CraftBuilder for the queued attempt."
+        guidebookRef = "nodeworks:lua-api/network.md#trycraft"
+    }
+
     method("route") {
         param(
             "alias",
