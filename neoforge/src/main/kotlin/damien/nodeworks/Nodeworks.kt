@@ -49,6 +49,9 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         // Touched from the netty payload handler thread and the main thread, so
         // it must be concurrent.
         private val diagnosticPreviewLastTick = java.util.concurrent.ConcurrentHashMap<java.util.UUID, Long>()
+
+        // Per-player throttle for DeviceSettingsPayload, ~10 pkt/sec.
+        private val deviceSettingsLastTick = java.util.concurrent.ConcurrentHashMap<java.util.UUID, Long>()
     }
 
     init {
@@ -121,6 +124,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
             ModItems.initialize()
             ModBlockEntities.initialize()
             damien.nodeworks.registry.ModEntityTypes.initialize()
+            damien.nodeworks.registry.ModSoundEvents.initialize()
             // Recipe types + serializers + display types. Ordering:
             //   1. ModRecipeTypes, the RecipeType marker the recipe class references.
             //   2. ModRecipeDisplayTypes, the display Type referenced by Recipe.display()
@@ -328,6 +332,22 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                     damien.nodeworks.screen.ProcessingHandlerMenu.clientFactory(syncId, inv, data)
                 }
             )
+            ModScreenHandlers.STORAGE_METER = Registry.register(
+                BuiltInRegistries.MENU,
+                ResourceKey.create(Registries.MENU, Identifier.fromNamespaceAndPath("nodeworks", "storage_meter")),
+                IMenuTypeExtension.create { syncId, inv, buf ->
+                    val data = damien.nodeworks.screen.StorageMeterOpenData.STREAM_CODEC.decode(buf)
+                    damien.nodeworks.screen.StorageMeterMenu.clientFactory(syncId, inv, data)
+                }
+            )
+            ModScreenHandlers.CRAFT_REQUESTER = Registry.register(
+                BuiltInRegistries.MENU,
+                ResourceKey.create(Registries.MENU, Identifier.fromNamespaceAndPath("nodeworks", "craft_requester")),
+                IMenuTypeExtension.create { syncId, inv, buf ->
+                    val data = damien.nodeworks.screen.CraftRequesterOpenData.STREAM_CODEC.decode(buf)
+                    damien.nodeworks.screen.CraftRequesterMenu.clientFactory(syncId, inv, data)
+                }
+            )
             ModScreenHandlers.initialize()
         }
     }
@@ -494,6 +514,14 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                 val player = context.player()
                 val level = player.level() as? ServerLevel ?: return@enqueueWork
                 if (!player.blockPosition().closerThan(payload.pos, 8.0)) return@enqueueWork
+                // Per-player throttle, 2 ticks (~10 pkt/sec). Caps macro spam.
+                // Null-check the map entry rather than using Long.MIN_VALUE as
+                // a sentinel, since `now - Long.MIN_VALUE` overflows and would
+                // drop the player's very first packet.
+                val now = level.server.tickCount.toLong()
+                val last = deviceSettingsLastTick[player.uuid]
+                if (last != null && now - last < 2) return@enqueueWork
+                deviceSettingsLastTick[player.uuid] = now
                 val entity = level.getBlockEntity(payload.pos) ?: return@enqueueWork
                 val newColor: net.minecraft.world.item.DyeColor? = if (payload.key == "channel") {
                     runCatching { net.minecraft.world.item.DyeColor.byId(payload.intValue) }.getOrNull()
@@ -561,6 +589,22 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                                     damien.nodeworks.block.entity.UserBlockEntity.UseMode.entries[ord]
                             }
                             "preview" -> entity.previewArea = payload.intValue != 0
+                        }
+                    }
+                    is damien.nodeworks.block.entity.StorageMeterBlockEntity -> {
+                        when (payload.key) {
+                            "channel" -> entity.channel = damien.nodeworks.network.ChannelFilter.fromNbtInt(payload.intValue)
+                            // Caps match the GUI clamp, MAX_INT from a crafted
+                            // client would have the meter chase a 2B threshold.
+                            "threshold" -> entity.threshold = payload.intValue.coerceIn(0, 1_000_000)
+                            "autocraft" -> entity.autocraftEnabled = payload.intValue != 0
+                        }
+                    }
+                    is damien.nodeworks.block.entity.CraftRequesterBlockEntity -> {
+                        when (payload.key) {
+                            "channel" -> entity.outputChannel = damien.nodeworks.network.ChannelFilter.fromNbtInt(payload.intValue)
+                            // Caps match the GUI clamp, see Meter above.
+                            "batch" -> entity.batchSize = payload.intValue.coerceIn(1, 1_000_000)
                         }
                     }
                 }
@@ -720,6 +764,38 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
             }
         }
 
+        registrar.playToServer(damien.nodeworks.network.GrappleReleasePayload.TYPE, damien.nodeworks.network.GrappleReleasePayload.CODEC) { _, context ->
+            context.enqueueWork {
+                damien.nodeworks.item.GrappleBeamSessions.release(context.player())
+            }
+        }
+
+        registrar.playToServer(damien.nodeworks.network.GrappleAdjustRopePayload.TYPE, damien.nodeworks.network.GrappleAdjustRopePayload.CODEC) { payload, context ->
+            context.enqueueWork {
+                val player = context.player()
+                val hook = damien.nodeworks.item.GrappleBeamSessions.current(player) ?: return@enqueueWork
+                if (hook.ropeLength < 0.0) return@enqueueWork
+                // 0.5 blocks per scroll tick is a comfortable speed.
+                // Sign convention depends on anchor type:
+                //   block:  scroll up reels the player in (shorter rope)
+                //   entity: scroll up pushes the held entity AWAY
+                //           (longer rope), physics-gun convention.
+                // Floor also depends on anchor type: blocks floor at
+                // 2.0 (outside the auto-release radius), entities at
+                // GrappleBeamPhysics.ENTITY_MIN_ROPE_LENGTH so a held
+                // entity stays at arm's length.
+                val delta = payload.deltaScrollTicks.toDouble() * 0.5
+                val isEntity = hook.attachedEntityId != 0
+                val minRope = if (isEntity) {
+                    damien.nodeworks.item.GrappleBeamPhysics.ENTITY_MIN_ROPE_LENGTH
+                } else {
+                    2.0
+                }
+                val ropeDelta = if (isEntity) delta else -delta
+                hook.ropeLength = (hook.ropeLength + ropeDelta).coerceIn(minRope, hook.maxRange)
+            }
+        }
+
         registrar.playToServer(DismissCpuFailurePayload.TYPE, DismissCpuFailurePayload.CODEC) { payload, context ->
             context.enqueueWork {
                 val player = context.player()
@@ -741,13 +817,13 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                 if (menu !is damien.nodeworks.screen.DiagnosticMenu) return@enqueueWork
                 if (menu.containerId != payload.containerId) return@enqueueWork
                 if (menu.clickedPos != payload.networkPos) return@enqueueWork
-                // Per-player request throttle. Diagnostic preview is a
-                // bounded-depth tree walk (depth 20) but still walks the
-                // network; cap to 10 requests/sec to fence off accidental
-                // or hostile spam from a modified client.
+                // Per-player request throttle, 2 ticks (~10 req/sec). Caps
+                // hostile spam from a modified client. Null-check rather than
+                // a Long.MIN_VALUE sentinel since `now - Long.MIN_VALUE`
+                // overflows and would drop the first packet after login.
                 val now = (player.level() as? ServerLevel)?.server?.tickCount?.toLong() ?: 0L
-                val last = diagnosticPreviewLastTick[player.uuid] ?: Long.MIN_VALUE
-                if (now - last < 2) return@enqueueWork
+                val last = diagnosticPreviewLastTick[player.uuid]
+                if (last != null && now - last < 2) return@enqueueWork
                 diagnosticPreviewLastTick[player.uuid] = now
 
                 val level = player.level() as? ServerLevel ?: return@enqueueWork
@@ -768,6 +844,42 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                 val menu = player.containerMenu
                 if (menu is damien.nodeworks.screen.ProcessingSetScreenHandler && menu.containerId == payload.containerId) {
                     menu.setSlotFromStack(payload.slotIndex, payload.stack)
+                }
+            }
+        }
+
+        registrar.playToServer(
+            damien.nodeworks.network.SetStorageMeterTargetPayload.TYPE,
+            damien.nodeworks.network.SetStorageMeterTargetPayload.CODEC,
+        ) { payload, context ->
+            context.enqueueWork {
+                val player = context.player()
+                val menu = player.containerMenu
+                if (menu is damien.nodeworks.screen.StorageMeterMenu && menu.containerId == payload.containerId) {
+                    val level = player.level() as? ServerLevel ?: return@enqueueWork
+                    val be = level.getBlockEntity(menu.devicePos) as? damien.nodeworks.block.entity.StorageMeterBlockEntity
+                        ?: return@enqueueWork
+                    be.target = if (payload.stack.isEmpty) net.minecraft.world.item.ItemStack.EMPTY
+                                else payload.stack.copyWithCount(1)
+                    menu.broadcastChanges()
+                }
+            }
+        }
+
+        registrar.playToServer(
+            damien.nodeworks.network.SetCraftRequesterTargetPayload.TYPE,
+            damien.nodeworks.network.SetCraftRequesterTargetPayload.CODEC,
+        ) { payload, context ->
+            context.enqueueWork {
+                val player = context.player()
+                val menu = player.containerMenu
+                if (menu is damien.nodeworks.screen.CraftRequesterMenu && menu.containerId == payload.containerId) {
+                    val level = player.level() as? ServerLevel ?: return@enqueueWork
+                    val be = level.getBlockEntity(menu.devicePos) as? damien.nodeworks.block.entity.CraftRequesterBlockEntity
+                        ?: return@enqueueWork
+                    be.target = if (payload.stack.isEmpty) net.minecraft.world.item.ItemStack.EMPTY
+                                else payload.stack.copyWithCount(1)
+                    menu.broadcastChanges()
                 }
             }
         }
@@ -884,6 +996,8 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                     payload.enabledModules,
                     payload.disabledMethods,
                     payload.networkControllerChunkLoading,
+                    payload.grappleMaxDistance,
+                    payload.grappleEntities,
                 )
             }
         }
@@ -945,6 +1059,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         for (level in event.server.allLevels) {
             damien.nodeworks.script.MonitorUpdateHelper.tick(level, tickCount)
         }
+        tickGrappleSessions(event.server)
         // Drain any connectables whose setLevel queued a LOS revalidation this past tick.
         // Deferred because in-line revalidation from setLevel would recurse into
         // level.getBlockEntity for the still-being-registered BE → StackOverflow.
@@ -953,6 +1068,39 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         // propagate calls can traverse fresh. Kept here rather than per-level because
         // the dedup is indexed by dimension and clearing once covers all levels.
         damien.nodeworks.network.NodeConnectionHelper.clearTickDedup()
+    }
+
+    /** Drives the Grapple Beam pull for every active session. Vanilla's
+     *  `onUseTick` path would slow the player to 0.2x movement (the bow draw),
+     *  so the item doesn't enter the using-item state and the server runs the
+     *  pull from here instead. Sessions self-evict when the hook entity is
+     *  gone, the player no longer holds a Grapple Beam, or
+     *  [damien.nodeworks.item.GrappleBeamPhysics.applyPullTick] returns false
+     *  (out-of-range auto-release). */
+    private fun tickGrappleSessions(server: net.minecraft.server.MinecraftServer) {
+        val snapshot = damien.nodeworks.item.GrappleBeamSessions.snapshot()
+        if (snapshot.isEmpty()) return
+        for ((uuid, hookId) in snapshot) {
+            val player = server.playerList.getPlayer(uuid)
+            if (player == null) {
+                damien.nodeworks.item.GrappleBeamSessions.clearForPlayer(uuid)
+                continue
+            }
+            val level = player.level() as? ServerLevel ?: continue
+            val hook = level.getEntity(hookId) as? damien.nodeworks.entity.GrappleBeamHookEntity
+            if (hook == null || hook.isRemoved) {
+                damien.nodeworks.item.GrappleBeamSessions.release(player)
+                continue
+            }
+            val stillHolding = player.mainHandItem.item is damien.nodeworks.item.GrappleBeamItem ||
+                player.offhandItem.item is damien.nodeworks.item.GrappleBeamItem
+            if (!stillHolding) {
+                damien.nodeworks.item.GrappleBeamSessions.release(player)
+                continue
+            }
+            val keepAlive = damien.nodeworks.item.GrappleBeamPhysics.applyPullTick(player, hook)
+            if (!keepAlive) damien.nodeworks.item.GrappleBeamSessions.release(player)
+        }
     }
 
     private fun onRegisterCommands(event: net.neoforged.neoforge.event.RegisterCommandsEvent) {
@@ -987,6 +1135,8 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
     private fun onPlayerDisconnect(event: net.neoforged.neoforge.event.entity.player.PlayerEvent.PlayerLoggedOutEvent) {
         damien.nodeworks.item.NetworkWrenchItem.clearSelection(event.entity.uuid)
         diagnosticPreviewLastTick.remove(event.entity.uuid)
+        deviceSettingsLastTick.remove(event.entity.uuid)
+        damien.nodeworks.item.GrappleBeamSessions.clearForPlayer(event.entity.uuid)
     }
 
     private fun onRightClickBlock(event: net.neoforged.neoforge.event.entity.player.PlayerInteractEvent.RightClickBlock) {
@@ -1017,6 +1167,8 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
             policy.enabledModules,
             policy.disabledMethods,
             policy.networkControllerChunkLoading,
+            policy.grappleMaxDistance,
+            policy.grappleEntities,
         )
         // event.player is non-null on join, null on /reload (broadcast). Iterate
         // getRelevantPlayers() which covers both cases without branching. The
@@ -1049,6 +1201,8 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                 newSettings.enabledModules,
                 newSettings.disabledMethods,
                 newSettings.networkControllerChunkLoading,
+                newSettings.grappleMaxDistance,
+                newSettings.grappleEntities,
             )
             for (p in server.playerList.players) {
                 net.neoforged.neoforge.network.PacketDistributor.sendToPlayer(p, payload)

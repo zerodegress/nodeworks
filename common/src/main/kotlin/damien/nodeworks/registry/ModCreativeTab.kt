@@ -72,6 +72,7 @@ object ModCreativeTab {
                 output.accept(ModItems.NODEWORKS_BOOK)
                 output.accept(ModItems.NETWORK_WRENCH)
                 output.accept(ModItems.DIAGNOSTIC_TOOL)
+                output.accept(ModItems.GRAPPLE_BEAM)
                 output.accept(ModItems.PORTABLE_INVENTORY_TERMINAL)
                 output.accept(ModItems.CARD_PROGRAMMER)
                 output.accept(ModItems.BLANK_CARD)
@@ -88,7 +89,10 @@ object ModCreativeTab {
                 output.accept(ModItems.DIMENSION_RANGE_UPGRADE)
                 output.accept(ModItems.MULTI_DIMENSION_RANGE_UPGRADE)
                 output.accept(ModBlocks.MONITOR)
+                output.accept(ModBlocks.STORAGE_METER)
+                output.accept(ModBlocks.CRAFT_REQUESTER)
                 output.accept(ModItems.CELESTINE_SHARD)
+                output.accept(ModItems.CHARGED_BEAM_CATALYST)
                 output.accept(ModItems.MILKY_SOUL_BALL)
             }
             .build()

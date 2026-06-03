@@ -15,6 +15,8 @@ import damien.nodeworks.render.ImportChestRenderer
 import damien.nodeworks.render.InstructionStorageRenderer
 import damien.nodeworks.render.InventoryTerminalRenderer
 import damien.nodeworks.render.MonitorRenderer
+import damien.nodeworks.render.CraftRequesterRenderer
+import damien.nodeworks.render.StorageMeterRenderer
 import damien.nodeworks.render.NodeConnectionRenderer
 import damien.nodeworks.render.NodeRenderer
 import damien.nodeworks.render.PipeRenderer
@@ -58,6 +60,8 @@ object NeoForgeClientSetup {
         modBus.addListener(::onRegisterStandaloneModels)
         modBus.addListener(::onModifyBakingResult)
         modBus.addListener(::onRegisterTooltipComponents)
+        modBus.addListener(::onRegisterGuiLayers)
+        modBus.addListener(::onRegisterClientExtensions)
 
         // Register the in-game guide synchronously during mod construction, NOT inside
         // FMLClientSetupEvent.enqueueWork. GuideME hooks the item-tooltip "Hold G" hint
@@ -104,6 +108,25 @@ object NeoForgeClientSetup {
                 event.isCanceled = true
             }
         }
+
+        // Polls keyUse each client tick so we can fire a release packet on
+        // the falling edge when the player lets go of right-click while a
+        // Grapple Beam hook is attached. The item bypasses Player.startUsingItem
+        // to avoid the bow-draw movement slow, so this is the only client-side
+        // signal the server gets that the grapple should retract.
+        NeoForge.EVENT_BUS.addListener { _: net.neoforged.neoforge.client.event.ClientTickEvent.Post ->
+            damien.nodeworks.client.GrappleBeamInput.tick()
+        }
+
+        // Intercepts scroll-wheel input while the player has an active
+        // Grapple Beam session: sends a rope-length adjustment to the server
+        // and cancels the event so the default hotbar-swap doesn't also fire.
+        // When NOT grappled, scroll behaves normally (toolbar swap).
+        NeoForge.EVENT_BUS.addListener { event: net.neoforged.neoforge.client.event.InputEvent.MouseScrollingEvent ->
+            if (damien.nodeworks.client.GrappleBeamInput.onScroll(event.scrollDeltaY)) {
+                event.isCanceled = true
+            }
+        }
     }
 
     private fun onClientSetup(event: FMLClientSetupEvent) {
@@ -128,6 +151,7 @@ object NeoForgeClientSetup {
             NodeConnectionRenderer.register()
             damien.nodeworks.render.CardPlacementPreviewRenderer.init()
             damien.nodeworks.render.UserPreviewRenderer.init()
+            damien.nodeworks.render.GrappleBeamRenderer.register()
         }
     }
 
@@ -139,6 +163,8 @@ object NeoForgeClientSetup {
         event.registerBlockEntityRenderer(ModBlockEntities.PIPE, ::PipeRenderer)
         event.registerBlockEntityRenderer(ModBlockEntities.PROCESSING_HANDLER, ::ProcessingHandlerRenderer)
         event.registerBlockEntityRenderer(ModBlockEntities.MONITOR, ::MonitorRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.STORAGE_METER, ::StorageMeterRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.CRAFT_REQUESTER, ::CraftRequesterRenderer)
         event.registerBlockEntityRenderer(ModBlockEntities.NETWORK_CONTROLLER, ::ControllerRenderer)
         event.registerBlockEntityRenderer(ModBlockEntities.VARIABLE, ::VariableRenderer)
         event.registerBlockEntityRenderer(ModBlockEntities.TERMINAL, ::TerminalRenderer)
@@ -156,6 +182,12 @@ object NeoForgeClientSetup {
         event.registerBlockEntityRenderer(ModBlockEntities.EXPORT_CHEST, ::ExportChestRenderer)
         event.registerEntityRenderer(damien.nodeworks.registry.ModEntityTypes.MILKY_SOUL_BALL) { ctx ->
             net.minecraft.client.renderer.entity.ThrownItemRenderer(ctx)
+        }
+        event.registerEntityRenderer(damien.nodeworks.registry.ModEntityTypes.GRAPPLE_BEAM_HOOK) { ctx ->
+            // Hook entity itself draws nothing. The beam line drawn by
+            // GrappleBeamRenderer is the only visible representation of
+            // the anchor point.
+            net.minecraft.client.renderer.entity.NoopRenderer<damien.nodeworks.entity.GrappleBeamHookEntity>(ctx)
         }
     }
 
@@ -186,6 +218,30 @@ object NeoForgeClientSetup {
     private val BREAKER_EMISSIVE_MODEL_KEY: net.neoforged.neoforge.client.model.standalone.StandaloneModelKey<net.minecraft.client.renderer.block.dispatch.BlockStateModelPart> =
         net.neoforged.neoforge.client.model.standalone.StandaloneModelKey { "nodeworks:breaker_emissive" }
 
+    /** Storage Meter network-colour emissive overlay. Inherits the geometry of
+     *  `nodeworks:block/storage_meter` and only swaps `#0` to
+     *  storage_meter_emissive.png. */
+    private val STORAGE_METER_EMISSIVE_MODEL_KEY: net.neoforged.neoforge.client.model.standalone.StandaloneModelKey<net.minecraft.client.renderer.block.dispatch.BlockStateModelPart> =
+        net.neoforged.neoforge.client.model.standalone.StandaloneModelKey { "nodeworks:storage_meter_emissive" }
+
+    /** Storage Meter redstone-active overlay. Same geometry inheritance, swaps
+     *  `#0` to storage_meter_redstone_active.png. Drawn alongside the network-
+     *  colour overlay when the meter is below threshold. */
+    private val STORAGE_METER_REDSTONE_ACTIVE_MODEL_KEY: net.neoforged.neoforge.client.model.standalone.StandaloneModelKey<net.minecraft.client.renderer.block.dispatch.BlockStateModelPart> =
+        net.neoforged.neoforge.client.model.standalone.StandaloneModelKey { "nodeworks:storage_meter_redstone_active" }
+
+    /** Craft Requester network-colour emissive overlay. Inherits the geometry
+     *  of `nodeworks:block/craft_requester` and only swaps `#0` to
+     *  craft_requester_emissive.png. */
+    private val CRAFT_REQUESTER_EMISSIVE_MODEL_KEY: net.neoforged.neoforge.client.model.standalone.StandaloneModelKey<net.minecraft.client.renderer.block.dispatch.BlockStateModelPart> =
+        net.neoforged.neoforge.client.model.standalone.StandaloneModelKey { "nodeworks:craft_requester_emissive" }
+
+    /** Craft Requester redstone-active overlay. Same geometry inheritance,
+     *  swaps `#0` to craft_requester_redstone_active.png. Drawn alongside the
+     *  network-colour overlay while the input signal is high. */
+    private val CRAFT_REQUESTER_REDSTONE_ACTIVE_MODEL_KEY: net.neoforged.neoforge.client.model.standalone.StandaloneModelKey<net.minecraft.client.renderer.block.dispatch.BlockStateModelPart> =
+        net.neoforged.neoforge.client.model.standalone.StandaloneModelKey { "nodeworks:craft_requester_redstone_active" }
+
     /** Emissive overlay model for the Variable block. Same parent-model
      *  pattern - inherits `nodeworks:block/variable`'s geometry and only
      *  swaps `#particle` to variable_emissive.png. */
@@ -198,6 +254,13 @@ object NeoForgeClientSetup {
      *  reloading them per-block. */
     private val COVERED_PIPE_INDICATOR_MODEL_KEY: net.neoforged.neoforge.client.model.standalone.StandaloneModelKey<net.minecraft.client.renderer.block.dispatch.BlockStateModelPart> =
         net.neoforged.neoforge.client.model.standalone.StandaloneModelKey { "nodeworks:covered_pipe_indicator" }
+
+    /** Floating cube that the Grapple Beam emits from. Baked separately
+     *  from the staff so its quads can be re-emitted on every frame with
+     *  a per-frame transform (passive spin + grapple-time anchor tracking
+     *  + pulse). The model file lives at `nodeworks:item/grapple_beam_cube`. */
+    private val GRAPPLE_BEAM_CUBE_MODEL_KEY: net.neoforged.neoforge.client.model.standalone.StandaloneModelKey<net.minecraft.client.renderer.block.dispatch.BlockStateModelPart> =
+        net.neoforged.neoforge.client.model.standalone.StandaloneModelKey { "nodeworks:grapple_beam_cube" }
 
     private fun onRegisterStandaloneModels(
         event: net.neoforged.neoforge.client.event.ModelEvent.RegisterStandalone
@@ -246,6 +309,50 @@ object NeoForgeClientSetup {
                 .getStandaloneModel(BREAKER_EMISSIVE_MODEL_KEY)
         }
 
+        val storageMeterEmissiveId = net.minecraft.resources.Identifier.fromNamespaceAndPath("nodeworks", "block/storage_meter_emissive")
+        event.register(
+            STORAGE_METER_EMISSIVE_MODEL_KEY,
+            net.neoforged.neoforge.client.model.standalone.SimpleUnbakedStandaloneModel.simpleModelWrapper(storageMeterEmissiveId),
+        )
+        damien.nodeworks.client.StorageMeterEmissiveModel.fetcher = {
+            net.minecraft.client.Minecraft.getInstance()
+                .modelManager
+                .getStandaloneModel(STORAGE_METER_EMISSIVE_MODEL_KEY)
+        }
+
+        val storageMeterRedstoneActiveId = net.minecraft.resources.Identifier.fromNamespaceAndPath("nodeworks", "block/storage_meter_redstone_active")
+        event.register(
+            STORAGE_METER_REDSTONE_ACTIVE_MODEL_KEY,
+            net.neoforged.neoforge.client.model.standalone.SimpleUnbakedStandaloneModel.simpleModelWrapper(storageMeterRedstoneActiveId),
+        )
+        damien.nodeworks.client.StorageMeterRedstoneActiveModel.fetcher = {
+            net.minecraft.client.Minecraft.getInstance()
+                .modelManager
+                .getStandaloneModel(STORAGE_METER_REDSTONE_ACTIVE_MODEL_KEY)
+        }
+
+        val craftRequesterEmissiveId = net.minecraft.resources.Identifier.fromNamespaceAndPath("nodeworks", "block/craft_requester_emissive")
+        event.register(
+            CRAFT_REQUESTER_EMISSIVE_MODEL_KEY,
+            net.neoforged.neoforge.client.model.standalone.SimpleUnbakedStandaloneModel.simpleModelWrapper(craftRequesterEmissiveId),
+        )
+        damien.nodeworks.client.CraftRequesterEmissiveModel.fetcher = {
+            net.minecraft.client.Minecraft.getInstance()
+                .modelManager
+                .getStandaloneModel(CRAFT_REQUESTER_EMISSIVE_MODEL_KEY)
+        }
+
+        val craftRequesterRedstoneActiveId = net.minecraft.resources.Identifier.fromNamespaceAndPath("nodeworks", "block/craft_requester_redstone_active")
+        event.register(
+            CRAFT_REQUESTER_REDSTONE_ACTIVE_MODEL_KEY,
+            net.neoforged.neoforge.client.model.standalone.SimpleUnbakedStandaloneModel.simpleModelWrapper(craftRequesterRedstoneActiveId),
+        )
+        damien.nodeworks.client.CraftRequesterRedstoneActiveModel.fetcher = {
+            net.minecraft.client.Minecraft.getInstance()
+                .modelManager
+                .getStandaloneModel(CRAFT_REQUESTER_REDSTONE_ACTIVE_MODEL_KEY)
+        }
+
         val variableEmissiveId = net.minecraft.resources.Identifier.fromNamespaceAndPath("nodeworks", "block/variable_emissive")
         event.register(
             VARIABLE_EMISSIVE_MODEL_KEY,
@@ -261,6 +368,12 @@ object NeoForgeClientSetup {
         event.register(
             COVERED_PIPE_INDICATOR_MODEL_KEY,
             net.neoforged.neoforge.client.model.standalone.SimpleUnbakedStandaloneModel.simpleModelWrapper(coveredPipeIndicatorId),
+        )
+
+        val grappleBeamCubeId = net.minecraft.resources.Identifier.fromNamespaceAndPath("nodeworks", "item/grapple_beam_cube")
+        event.register(
+            GRAPPLE_BEAM_CUBE_MODEL_KEY,
+            net.neoforged.neoforge.client.model.standalone.SimpleUnbakedStandaloneModel.simpleModelWrapper(grappleBeamCubeId),
         )
     }
 
@@ -313,6 +426,24 @@ object NeoForgeClientSetup {
             baselineProperties = baselineProps,
             indicatorPart = indicatorPart,
         )
+
+        // Grapple Beam: wrap the baseline staff with a composite that
+        // also emits the standalone-baked cube quads on a second layer
+        // with a per-frame animated transform. The cube's visible size
+        // can be tuned via GrappleBeamItemModel.CUBE_VISUAL_SCALE.
+        val grappleCubePart = bakingResult.standaloneModels().get(GRAPPLE_BEAM_CUBE_MODEL_KEY)
+        if (grappleCubePart != null) {
+            val grappleId = net.minecraft.resources.Identifier.fromNamespaceAndPath("nodeworks", "grapple_beam")
+            val grappleBaseline = itemModels[grappleId]
+            val grappleProps = grappleBaseline?.let { extractItemModelProperties(it) }
+            if (grappleBaseline != null && grappleProps != null) {
+                itemModels[grappleId] = damien.nodeworks.client.model.GrappleBeamItemModel(
+                    baselineStaff = grappleBaseline,
+                    cubeProperties = grappleProps,
+                    cubePart = grappleCubePart,
+                )
+            }
+        }
     }
 
     /** Pull [net.minecraft.client.renderer.item.ModelRenderProperties] off
@@ -440,6 +571,12 @@ object NeoForgeClientSetup {
         event.register(ModScreenHandlers.PROCESSING_HANDLER) { menu, inventory, title ->
             damien.nodeworks.screen.ProcessingHandlerScreen(menu, inventory, title)
         }
+        event.register(ModScreenHandlers.STORAGE_METER) { menu, inventory, title ->
+            damien.nodeworks.screen.StorageMeterScreen(menu, inventory, title)
+        }
+        event.register(ModScreenHandlers.CRAFT_REQUESTER) { menu, inventory, title ->
+            damien.nodeworks.screen.CraftRequesterScreen(menu, inventory, title)
+        }
     }
 
     /** Wire [damien.nodeworks.screen.tooltip.RecipeIconTooltip] (server-safe
@@ -454,6 +591,25 @@ object NeoForgeClientSetup {
         event.register(damien.nodeworks.screen.tooltip.RecipeIconTooltip::class.java) { data ->
             damien.nodeworks.screen.tooltip.RecipeIconTooltipRenderer(data)
         }
+    }
+
+    /** Wires the Grapple Beam item's first-person animation. The
+     *  extension handler reads lerped state from [GrappleBeamAnimState]
+     *  each frame and tilts/extends/scales the held staff. */
+    private fun onRegisterClientExtensions(
+        event: net.neoforged.neoforge.client.extensions.common.RegisterClientExtensionsEvent
+    ) {
+        event.registerItem(GrappleBeamClientExtensions, damien.nodeworks.registry.ModItems.GRAPPLE_BEAM)
+    }
+
+    private fun onRegisterGuiLayers(event: net.neoforged.neoforge.client.event.RegisterGuiLayersEvent) {
+        event.registerAbove(
+            net.neoforged.neoforge.client.gui.VanillaGuiLayers.CROSSHAIR,
+            net.minecraft.resources.Identifier.fromNamespaceAndPath("nodeworks", "grapple_beam_hud"),
+            net.neoforged.neoforge.client.gui.GuiLayer { graphics, delta ->
+                damien.nodeworks.client.GrappleBeamHud.render(graphics, delta)
+            },
+        )
     }
 
     private fun onRegisterRenderPipelines(

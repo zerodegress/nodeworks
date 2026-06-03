@@ -81,10 +81,26 @@ object ModItems {
         Item.Properties()
     )
 
+    val CHARGED_BEAM_CATALYST: Item = register(
+        "charged_beam_catalyst",
+        ::Item,
+        Item.Properties()
+            .stacksTo(16)
+            .rarity(net.minecraft.world.item.Rarity.RARE)
+    )
+
     val DIAGNOSTIC_TOOL: Item = register(
         "diagnostic_tool",
         ::DiagnosticToolItem,
         Item.Properties().stacksTo(1)
+    )
+
+    val GRAPPLE_BEAM: Item = register(
+        "grapple_beam",
+        { props -> damien.nodeworks.item.GrappleBeamItem(props) },
+        Item.Properties()
+            .stacksTo(1)
+            .rarity(net.minecraft.world.item.Rarity.EPIC)
     )
 
     val CARD_PROGRAMMER: Item = register(
@@ -123,6 +139,7 @@ object ModItems {
         Item.Properties()
             .stacksTo(1)
             .component(net.minecraft.core.component.DataComponents.ENCHANTMENT_GLINT_OVERRIDE, true)
+            .rarity(net.minecraft.world.item.Rarity.RARE)
     )
 
     val MULTI_DIMENSION_RANGE_UPGRADE: Item = register(
@@ -131,12 +148,15 @@ object ModItems {
         Item.Properties()
             .stacksTo(1)
             .component(net.minecraft.core.component.DataComponents.ENCHANTMENT_GLINT_OVERRIDE, true)
+            .rarity(net.minecraft.world.item.Rarity.EPIC)
     )
 
     val PORTABLE_INVENTORY_TERMINAL: Item = register(
         "portable_inventory_terminal",
         ::PortableInventoryTerminalItem,
-        Item.Properties().stacksTo(1),
+        Item.Properties()
+            .stacksTo(1)
+            .rarity(net.minecraft.world.item.Rarity.RARE),
     )
 
     val NODEWORKS_BOOK: Item = register(

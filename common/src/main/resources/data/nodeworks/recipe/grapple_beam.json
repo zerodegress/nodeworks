@@ -1,0 +1,18 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    " FC",
+    "ENF",
+    "NE "
+  ],
+  "key": {
+    "F": "nodeworks:focus_node",
+    "C": "nodeworks:charged_beam_catalyst",
+    "N": "minecraft:netherite_ingot",
+    "E": "minecraft:ender_eye"
+  },
+  "result": {
+    "id": "nodeworks:grapple_beam",
+    "count": 1
+  }
+}
